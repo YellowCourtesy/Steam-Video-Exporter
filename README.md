@@ -17,7 +17,8 @@ This script processes raw Steam gameplay recordings (stored as fragmented video 
 
 ### 🎮 Automatic Game Name Resolution
 - Extracts SteamIDs from clip filenames
-- Queries Steam API and SteamDB for game names
+- 3-tier resolution: Steam Store API → SteamDB → bulk app list fallback
+- The full ~50 MB app list is only downloaded as a last resort if both APIs fail
 - Local caching to avoid repeated API calls
 - Handles failed lookups gracefully
 
@@ -31,7 +32,7 @@ This script processes raw Steam gameplay recordings (stored as fragmented video 
 ### 🚀 Performance Optimizations
 - Parallel job execution (CPU threads −2)
 - RAM-backed temp directories (no disk I/O bottleneck)
-- Batch SteamID resolution
+- Lightweight per-ID API lookups before any bulk download
 - Process substitution for stream copying
 - GPU retry fallback on CPU if GPU encode fails
 
@@ -71,50 +72,54 @@ chmod +x convert-clips.sh
 ./convert-clips.sh
 ```
 
-The script will prompt you for:
-1. **Debug mode**: Enable detailed logging (`y/N`)
-2. **AV1 encoding**: Re-encode with AV1 for compression (`Y/n`)
-
-## Examples
-
-### Encode only (no re-encode)
-```bash
-av1_disabled="true" ./convert-clips.sh
+The script will prompt you to select an encoder:
+```
+Select encoder:
+  1) copy  — stream copy, no re-encode (fast)
+  2) av1   — re-encode with AV1 (smaller files, slower)
+Encoder [1/2] (default: 1):
 ```
 
-### Force AV1, disable prompts
-```bash
-av1_forced="true" debug_mode_disabled="true" ./convert-clips.sh
-```
-
-### Debug mode for troubleshooting
-```bash
-debug_mode_forced="true" ./convert-clips.sh
-```
+Press Enter to accept the default, or type `1` or `2` to choose.
 
 ## Configuration
 
 Edit the script's `SECTION 1: ENVIRONMENT SETUP` to customize:
 
 ```bash
-# Force AV1 encoding without prompting
-av1_forced="true"
+# --- Encoding & debug configuration ---
 
-# Disable AV1 (output files will use stream copy instead)
-av1_disabled="true"
+# default_encoder: "copy" = stream copy (fast, no re-encode)
+#                  "av1"  = re-encode with AV1 (smaller files, slower)
+# This sets the default for the interactive encoder prompt.
+# To skip the prompt entirely, also set encoder_prompt=false below.
+default_encoder="copy"
 
-# Force debug mode on
-debug_mode_forced="true"
+# Set to false to suppress the encoder prompt and use default_encoder as-is
+encoder_prompt=true
 
-# Suppress debug mode prompt
-debug_mode_disabled="true"
+# Debug mode: true = print each command before executing (set -x)
+debug_mode=false
+```
+
+### Examples
+
+```bash
+# Run with defaults (stream copy, encoder prompt shown)
+./convert-clips.sh
+
+# Skip the prompt entirely and force AV1 encoding
+# (edit in script: default_encoder="av1", encoder_prompt=false)
+
+# Enable debug tracing for troubleshooting
+# (edit in script: debug_mode=true)
 ```
 
 ## Output
 
 ### Processed Files
 
-Output files are created in `Output/` with the pattern:
+Output files are created in `CONVERTED/` with the pattern:
 
 ```
 GameName_YYYYMMDD_HHMMSS_av1.mkv  # If AV1 encoded
@@ -130,7 +135,6 @@ Half-Life_Alyx_20260320_091530_av1.mkv
 ### Cache Files
 
 - `steam_id_cache.txt`: TSV cache of SteamID → Game Name mappings
-- `.steam_app_list_cache.json`: Downloaded Steam app list (50 MB)
 - `errors.txt`: ffprobe warnings and stream integrity issues
 
 ### Logs
@@ -144,7 +148,8 @@ Half-Life_Alyx_20260320_091530_av1.mkv
 - Detects OS (Linux/macOS)
 - Verifies dependencies
 - Detects GPU hardware and available encoders
-- Prompts for encoding options
+- Applies debug mode if enabled
+- Prompts for encoder selection (unless suppressed)
 
 ### Step 2: Main Processing Loop
 - Collects all clip directories
@@ -157,9 +162,11 @@ Half-Life_Alyx_20260320_091530_av1.mkv
   - Probes output for stream integrity
 
 ### Step 3: Game Name Resolution
-- Pre-downloads Steam app list (one-time, ~50 MB)
-- Batch-resolves all missing SteamIDs in single jq pass
-- Queries SteamDB API for IDs not in Steam's app list
+- For each unique SteamID extracted from filenames:
+  1. **Cache check** — returns immediately if a previous run resolved this ID
+  2. **Steam Store API** — lightweight per-ID query (`store.steampowered.com/api/appdetails`)
+  3. **SteamDB API** — fallback per-ID query (`steamdb.info/api/GetAppDetails`)
+  4. **Bulk app list** — only downloaded if any IDs remain unresolved after both APIs fail; fetched once per run, all remaining IDs batch-resolved in a single pass, then deleted
 - Updates local cache with results
 - Renames files with sanitized game names
 
@@ -175,10 +182,7 @@ Half-Life_Alyx_20260320_091530_av1.mkv
 ## Performance Tips
 
 ### Disable AV1 for Speed
-Stream copying is much faster than re-encoding:
-```bash
-av1_disabled="true" ./convert-clips.sh
-```
+Stream copying is much faster than re-encoding. Set `default_encoder="copy"` and `encoder_prompt=false` to skip the prompt and always stream-copy.
 
 ### GPU Encoding
 If you have a supported GPU, AV1 hardware encoding is 5–10× faster than CPU:
@@ -200,4 +204,4 @@ Issues, improvements, and suggestions welcome!
 
 ---
 
-**Last Updated**: 2026-03-23
+**Last Updated**: 2026-03-24
