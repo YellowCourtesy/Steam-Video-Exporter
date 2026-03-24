@@ -14,23 +14,22 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # --- Directory & file paths (all relative to script_dir by default) ---
 clips_dir="${script_dir}/clips"           # Input: folder of clip subdirectories
-output_dir="${script_dir}/CONVERTED"         # Output: final processed video files
+output_dir="${script_dir}/Output"         # Output: final processed video files
 steam_id_cache="${script_dir}/steam_id_cache.txt"  # TSV: id <tab> name <tab> source <tab> date
 ffprobe_errors="${script_dir}/errors.txt"          # All ffprobe stream-integrity warnings, appended each run
 
-# If set to "true", AV1 re-encode is forced on without asking the user
-av1_forced="false"
+# --- Encoding & debug configuration ---
+# default_encoder: "copy" = stream copy (fast, no re-encode)
+#                  "av1"  = re-encode with AV1 (smaller files, slower)
+# This sets the default answer for the interactive AV1 prompt.
+# To skip the prompt entirely, also set encoder_prompt=false below.
+default_encoder="copy"
 
-# If set to "true", AV1 re-encode is forced off without asking the user
-# (av1_forced takes precedence if both are somehow set to "true")
-av1_disabled="false"
+# Set to false to suppress the AV1 encoding prompt and use default_encoder as-is
+encoder_prompt=true
 
-# If set to "true", debug mode is enabled without asking the user
-debug_mode_forced="false"
-
-# If set to "true", the debug mode prompt is suppressed and debug stays off
-# (debug_mode_forced takes precedence if both are somehow set to "true")
-debug_mode_disabled="false"
+# Debug mode: true = print each command before executing (set -x)
+debug_mode=false
 
 # Temporary error log; PID-suffixed copies are written by parallel jobs
 temp_errors="${script_dir}/temp_errors.txt"
@@ -218,56 +217,46 @@ detect_gpu() {
 detect_gpu
 
 # ---------------------------------------------------------------------------
-# Interactive prompts
-# (Skipped for individual options when their force/disable flag is set above)
+# Apply debug mode (no prompt — controlled entirely by the variable above)
 # ---------------------------------------------------------------------------
-
-# 1. Debug mode
-# debug_mode_forced=true   → always on, no prompt
-# debug_mode_disabled=true → always off, no prompt (forced wins if both true)
-# otherwise                → ask the user (default no)
-if [[ "${debug_mode_forced}" == "true" ]]; then
-    debug_mode=true
+if [[ "${debug_mode}" == "true" ]]; then
     set -x
-    echo "Debug mode enabled (forced)."
-elif [[ "${debug_mode_disabled}" == "true" ]]; then
-    debug_mode=false
-else
-    read -r -p "Enable debug mode? [y/N]: " debug_input
-    debug_input="${debug_input,,}"   # lowercase
-    if [[ "${debug_input}" == "y" || "${debug_input}" == "yes" ]]; then
-        debug_mode=true
-        set -x   # Print each command before executing
-        echo "Debug mode enabled."
-    else
-        debug_mode=false
-    fi
+    echo "Debug mode enabled."
 fi
 
-# 2. AV1 re-encode
-# av1_forced=true  → always encode with AV1, no prompt
-# av1_disabled=true → never encode with AV1, no prompt (av1_forced wins if both true)
-# otherwise        → ask the user (default yes)
-encode_av1=true   # Default: yes
-if [[ "${av1_forced}" == "true" ]]; then
-    encode_av1=true
-    echo "AV1 encoding enabled (forced)."
-elif [[ "${av1_disabled}" == "true" ]]; then
-    encode_av1=false
-    echo "AV1 encoding disabled (forced off)."
-else
-    read -r -p "Re-encode output files with AV1 to save space? [Y/n]: " av1_input
-    av1_input="${av1_input,,}"
-    if [[ "${av1_input}" == "n" || "${av1_input}" == "no" ]]; then
-        encode_av1=false
+# ---------------------------------------------------------------------------
+# Resolve encoder selection
+# ---------------------------------------------------------------------------
+encoder="${default_encoder}"
+
+# Optionally prompt the user to choose an encoder
+if [[ "${encoder_prompt}" == "true" ]]; then
+    echo "Select encoder:"
+    echo "  1) copy  — stream copy, no re-encode (fast)"
+    echo "  2) av1   — re-encode with AV1 (smaller files, slower)"
+    if [[ "${default_encoder}" == "av1" ]]; then
+        read -r -p "Encoder [1/2] (default: 2): " encoder_input
+    else
+        read -r -p "Encoder [1/2] (default: 1): " encoder_input
     fi
+    case "${encoder_input}" in
+        1) encoder="copy" ;;
+        2) encoder="av1"  ;;
+        "") ;;  # keep default_encoder
+        *)
+            echo -e "${YELLOW}[WARN] Invalid choice '${encoder_input}', using default: ${default_encoder}${NC}"
+            ;;
+    esac
 fi
+
+encode_av1=false
+[[ "${encoder}" == "av1" ]] && encode_av1=true
 
 echo ""
 echo "Configuration:"
 echo "  OS            : ${os}"
 echo "  Debug mode    : ${debug_mode}"
-echo "  AV1 encode    : ${encode_av1}"
+echo "  Encoder       : ${encoder}"
 echo "  GPU vendor    : ${gpu_vendor}"
 echo "  Clips dir     : ${clips_dir}"
 echo "  Output dir    : ${output_dir}"
@@ -627,69 +616,8 @@ cache_lock="${steam_id_cache}.lock"
 rate_limit_sec=1
 
 # ---------------------------------------------------------------------------
-# 3c-pre. Pre-download Steam app list and batch-resolve all cache misses.
-# Instead of invoking jq on the 50 MB JSON once per cache miss, we:
-#   1. Collect all SteamIDs that are not in the cache (or are ERROR entries).
-#   2. Download the app list once (if not already cached).
-#   3. Run a single jq pass to extract names for ALL needed IDs at once.
-# This turns N × O(50 MB) into 1 × O(50 MB).
+# Helper functions for SteamID resolution
 # ---------------------------------------------------------------------------
-steam_list_cache="${script_dir}/.steam_app_list_cache.json"
-
-# Collect IDs that need resolution
-declare -A prefetched_names   # map: steam_id → game_name (from batch lookup)
-ids_needing_lookup=()
-
-for steam_id in "${!steam_id_to_files[@]}"; do
-    cached_name="$(lookup_cache "${steam_id}")"
-    if [[ -z "${cached_name}" ]]; then
-        ids_needing_lookup+=("${steam_id}")
-    fi
-done
-
-# If there are cache misses, pre-download the app list and batch-resolve
-if [[ "${#ids_needing_lookup[@]}" -gt 0 ]]; then
-    echo "[PREFETCH] ${#ids_needing_lookup[@]} SteamID(s) need resolution"
-
-    # Download the app list once if not already cached
-    if [[ ! -f "${steam_list_cache}" ]]; then
-        echo "[INFO] Downloading Steam app list (one-time, may take a moment)..."
-        curl -s --max-time 60 \
-            "https://api.steampowered.com/ISteamApps/GetAppList/v2/" \
-            -o "${steam_list_cache}" || true
-    fi
-
-    # Batch jq lookup: single pass over the 50 MB JSON for all needed IDs.
-    # Output format: one "id\tname" per line.
-    if [[ -f "${steam_list_cache}" ]] && command -v jq &>/dev/null; then
-        # Build a jq filter array from the needed IDs
-        jq_id_array="$(printf '%s\n' "${ids_needing_lookup[@]}" | jq -R 'tonumber' | jq -s '.')"
-
-        while IFS=$'\t' read -r resolved_id resolved_name; do
-            [[ -n "${resolved_id}" && -n "${resolved_name}" ]] || continue
-            prefetched_names["${resolved_id}"]="${resolved_name}"
-        done < <(
-            jq -r --argjson ids "${jq_id_array}" \
-                '[.applist.apps[] | select(.appid as $a | $ids | index($a))] | .[] | "\(.appid)\t\(.name)"' \
-                "${steam_list_cache}" 2>/dev/null || true
-        )
-
-        echo "[PREFETCH] Resolved ${#prefetched_names[@]} name(s) from Steam app list in one pass"
-    elif [[ -f "${steam_list_cache}" ]]; then
-        # grep fallback when jq is absent — still faster than per-ID grep
-        # because we read the file once and pipe through all patterns
-        grep_pattern="$(printf '"appid":\\s*%s\\s*,' "${ids_needing_lookup[@]}" | sed 's/,$//')"
-        # Fall back to per-ID grep (still one file read per ID, but no jq)
-        for sid in "${ids_needing_lookup[@]}"; do
-            resolved="$(grep -oP '"appid":\s*'"${sid}"'\s*,\s*"name":\s*"\K[^"]+' \
-                "${steam_list_cache}" | head -n 1 || true)"
-            if [[ -n "${resolved}" ]]; then
-                prefetched_names["${sid}"]="${resolved}"
-            fi
-        done
-        echo "[PREFETCH] Resolved ${#prefetched_names[@]} name(s) via grep fallback"
-    fi
-fi
 
 # Helper: acquire exclusive lock (busy-wait with short sleep)
 acquire_lock() {
@@ -714,7 +642,6 @@ lookup_cache() {
         # TSV: id <tab> name <tab> source <tab> date
         source="$(echo "${line}" | cut -f3)"
         if [[ "${source}" == "ERROR" ]]; then
-            # Previously failed — treat as miss so we retry the APIs
             echo ""
         else
             echo "${line}" | cut -f2
@@ -724,35 +651,48 @@ lookup_cache() {
     fi
 }
 
-# Helper: fetch game name from SteamDB, fallback to pre-fetched batch results.
-# The Steam app list is now pre-downloaded and batch-parsed in step 3c-pre,
-# so this function checks the prefetched_names map instead of re-parsing
-# the 50 MB JSON file for every single ID.
+# Helper: query the Steam Store API for a single app ID.
+# Response JSON: {"<id>":{"success":true,"data":{"name":"Game Name",...}}}
 # Sets global variables: fetched_name, fetched_source
-fetch_game_name() {
+fetch_from_steam_store() {
     local id="$1"
     fetched_name=""
     fetched_source=""
 
-    # ---- Check batch-prefetched results first (instant, no I/O) ----
-    if [[ -n "${prefetched_names[${id}]+_}" && -n "${prefetched_names[${id}]}" ]]; then
-        fetched_name="${prefetched_names[${id}]}"
-        fetched_source="steamapi"
-        return 0
-    fi
+    local store_response
+    store_response="$(curl -s --max-time 30 \
+        "https://store.steampowered.com/api/appdetails?appids=${id}" || true)"
 
-    # ---- Try SteamDB API (for IDs not in the app list) ----
-    # Response JSON: {"data":{"name":"Game Name",...},...}
+    if [[ -n "${store_response}" ]]; then
+        if command -v jq &>/dev/null; then
+            fetched_name="$(echo "${store_response}" | jq -r ".[\"${id}\"].data.name // empty" 2>/dev/null || true)"
+        else
+            fetched_name="$(echo "${store_response}" | grep -oP '"name"\s*:\s*"\K[^"]+' | head -n 1 || true)"
+        fi
+        if [[ -n "${fetched_name}" && "${fetched_name}" != "null" ]]; then
+            fetched_source="steamstore"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Helper: query the SteamDB API for a single app ID.
+# Response JSON: {"data":{"name":"Game Name",...},...}
+# Sets global variables: fetched_name, fetched_source
+fetch_from_steamdb() {
+    local id="$1"
+    fetched_name=""
+    fetched_source=""
+
     local steamdb_response
     steamdb_response="$(curl -s --max-time 30 \
         "https://steamdb.info/api/GetAppDetails/?appid=${id}" || true)"
 
     if [[ -n "${steamdb_response}" ]]; then
         if command -v jq &>/dev/null; then
-            # jq gives a precise, reliable parse
             fetched_name="$(echo "${steamdb_response}" | jq -r '.data.name // empty' 2>/dev/null || true)"
         else
-            # grep fallback when jq is absent
             fetched_name="$(echo "${steamdb_response}" | grep -oP '"name"\s*:\s*"\K[^"]+' | head -n 1 || true)"
         fi
         if [[ -n "${fetched_name}" && "${fetched_name}" != "null" ]]; then
@@ -760,74 +700,151 @@ fetch_game_name() {
             return 0
         fi
     fi
-
-    # Both sources failed — name remains empty
     return 1
 }
 
 # Sanitise a game name so it's safe as a filename component
 sanitise_name() {
-    # Replace characters that are problematic in filenames with underscores
     echo "$1" | tr -s '/:*?"<>|\\' '_'
 }
 
-# Process each unique SteamID
+# ---------------------------------------------------------------------------
+# Helper: write a resolved name to the cache (replaces any prior entry)
+# ---------------------------------------------------------------------------
+write_cache() {
+    local id="$1" name="$2" source="$3"
+    local entry_date
+    entry_date="$(date '+%Y-%m-%d')"
+    acquire_lock
+    local tmp="${steam_id_cache}.tmp.$$"
+    grep -vP "^${id}\t" "${steam_id_cache}" > "${tmp}" || true
+    mv "${tmp}" "${steam_id_cache}"
+    printf '%s\t%s\t%s\t%s\n' "${id}" "${name}" "${source}" "${entry_date}" \
+        >> "${steam_id_cache}"
+    release_lock
+}
+
+# ---------------------------------------------------------------------------
+# 3c-i. First pass: try Steam Store API → SteamDB for each cache miss.
+# IDs that still fail are collected for the bulk app-list fallback.
+# ---------------------------------------------------------------------------
+steam_list_cache="${script_dir}/.steam_app_list_cache.json"
+declare -A resolved_names   # map: steam_id → game_name (resolved this run)
+ids_still_unresolved=()     # IDs that need the bulk fallback
+
 for steam_id in "${!steam_id_to_files[@]}"; do
     echo "[STEAM] Processing ID: ${steam_id}"
 
     game_name=""
 
-    # --- Acquire lock, check cache ---
+    # --- Check cache first ---
     acquire_lock
     game_name="$(lookup_cache "${steam_id}")"
     release_lock
 
     if [[ -n "${game_name}" ]]; then
         echo "[CACHE HIT] ${steam_id} → ${game_name}"
-    else
-        echo "[CACHE MISS] ${steam_id} — querying APIs..."
-
-        # Only enforce rate limit if we'll actually hit an external API.
-        # Prefetched names (from the batch jq pass) need no network call.
-        if [[ -z "${prefetched_names[${steam_id}]+_}" ]]; then
-            sleep "${rate_limit_sec}"
-        fi
-
-        if fetch_game_name "${steam_id}"; then
-            game_name="${fetched_name}"
-            echo "[FETCH] ${steam_id} → ${game_name} (via ${fetched_source})"
-
-            # --- Atomically write to cache (replace any prior ERROR entry) ---
-            entry_date="$(date '+%Y-%m-%d')"
-            acquire_lock
-            # Remove any existing line for this ID (e.g. a prior ERROR entry)
-            tmp_replace="${steam_id_cache}.replace.$$"
-            grep -vP "^${steam_id}\t" "${steam_id_cache}" > "${tmp_replace}" || true
-            mv "${tmp_replace}" "${steam_id_cache}"
-            printf '%s\t%s\t%s\t%s\n' \
-                "${steam_id}" "${game_name}" "${fetched_source}" "${entry_date}" \
-                >> "${steam_id_cache}"
-            release_lock
-        else
-            echo -e "${YELLOW}[WARN] Could not resolve SteamID: ${steam_id}${NC}"
-            # Write/update an ERROR entry in the cache so we remember this ID
-            # and can retry it on future runs. Remove any previous ERROR line first.
-            entry_date="$(date '+%Y-%m-%d')"
-            acquire_lock
-            # Strip any existing entry for this ID (successful or prior ERROR)
-            tmp_strip="${steam_id_cache}.strip.$$"
-            grep -vP "^${steam_id}\t" "${steam_id_cache}" > "${tmp_strip}" || true
-            mv "${tmp_strip}" "${steam_id_cache}"
-            printf '%s\t%s\t%s\t%s\n' \
-                "${steam_id}" "ERROR" "ERROR" "${entry_date}" \
-                >> "${steam_id_cache}"
-            release_lock
-            game_name=""   # Signal that rename should be skipped
-        fi
+        resolved_names["${steam_id}"]="${game_name}"
+        continue
     fi
 
-    # --- Rename each file that has this SteamID prefix ---
-    # Skip renaming entirely when no name was resolved.
+    echo "[CACHE MISS] ${steam_id} — querying APIs..."
+    sleep "${rate_limit_sec}"
+
+    # Try Steam Store API first
+    if fetch_from_steam_store "${steam_id}"; then
+        game_name="${fetched_name}"
+        echo "[FETCH] ${steam_id} → ${game_name} (via ${fetched_source})"
+        write_cache "${steam_id}" "${game_name}" "${fetched_source}"
+        resolved_names["${steam_id}"]="${game_name}"
+        continue
+    fi
+
+    sleep "${rate_limit_sec}"
+
+    # Try SteamDB second
+    if fetch_from_steamdb "${steam_id}"; then
+        game_name="${fetched_name}"
+        echo "[FETCH] ${steam_id} → ${game_name} (via ${fetched_source})"
+        write_cache "${steam_id}" "${game_name}" "${fetched_source}"
+        resolved_names["${steam_id}"]="${game_name}"
+        continue
+    fi
+
+    echo "[MISS] ${steam_id} — both APIs failed, deferring to bulk fallback"
+    ids_still_unresolved+=("${steam_id}")
+done
+
+# ---------------------------------------------------------------------------
+# 3c-ii. Bulk fallback: download the full Steam app list ONLY if there are
+# unresolved IDs remaining. Downloaded at most once per run.
+# ---------------------------------------------------------------------------
+if [[ "${#ids_still_unresolved[@]}" -gt 0 ]]; then
+    echo "[FALLBACK] ${#ids_still_unresolved[@]} ID(s) unresolved — downloading Steam app list..."
+
+    # Download the app list (always fresh — not cached across runs)
+    curl -s --max-time 60 \
+        "https://api.steampowered.com/ISteamApps/GetAppList/v2/" \
+        -o "${steam_list_cache}" || true
+
+    if [[ -f "${steam_list_cache}" ]]; then
+        declare -A bulk_names
+
+        if command -v jq &>/dev/null; then
+            # Single jq pass for all unresolved IDs
+            jq_id_array="$(printf '%s\n' "${ids_still_unresolved[@]}" | jq -R 'tonumber' | jq -s '.')"
+
+            while IFS=$'\t' read -r resolved_id resolved_name; do
+                [[ -n "${resolved_id}" && -n "${resolved_name}" ]] || continue
+                bulk_names["${resolved_id}"]="${resolved_name}"
+            done < <(
+                jq -r --argjson ids "${jq_id_array}" \
+                    '[.applist.apps[] | select(.appid as $a | $ids | index($a))] | .[] | "\(.appid)\t\(.name)"' \
+                    "${steam_list_cache}" 2>/dev/null || true
+            )
+        else
+            # grep fallback when jq is absent
+            for sid in "${ids_still_unresolved[@]}"; do
+                resolved="$(grep -oP '"appid":\s*'"${sid}"'\s*,\s*"name":\s*"\K[^"]+' \
+                    "${steam_list_cache}" | head -n 1 || true)"
+                if [[ -n "${resolved}" ]]; then
+                    bulk_names["${sid}"]="${resolved}"
+                fi
+            done
+        fi
+
+        echo "[FALLBACK] Resolved ${#bulk_names[@]} name(s) from Steam app list"
+
+        # Write resolved names to cache and resolved_names map
+        for sid in "${ids_still_unresolved[@]}"; do
+            if [[ -n "${bulk_names[${sid}]+_}" && -n "${bulk_names[${sid}]}" ]]; then
+                echo "[FALLBACK] ${sid} → ${bulk_names[${sid}]}"
+                write_cache "${sid}" "${bulk_names[${sid}]}" "steamapi"
+                resolved_names["${sid}"]="${bulk_names[${sid}]}"
+            else
+                echo -e "${YELLOW}[WARN] Could not resolve SteamID: ${sid} (all sources exhausted)${NC}"
+                write_cache "${sid}" "ERROR" "ERROR"
+            fi
+        done
+
+        # Clean up the bulk download — not cached across runs
+        rm -f "${steam_list_cache}"
+    else
+        echo -e "${YELLOW}[WARN] Failed to download Steam app list${NC}"
+        # Mark all remaining IDs as errors
+        for sid in "${ids_still_unresolved[@]}"; do
+            echo -e "${YELLOW}[WARN] Could not resolve SteamID: ${sid}${NC}"
+            write_cache "${sid}" "ERROR" "ERROR"
+        done
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 3c-iii. Rename files using resolved names
+# ---------------------------------------------------------------------------
+for steam_id in "${!steam_id_to_files[@]}"; do
+    game_name="${resolved_names[${steam_id}]:-}"
+
     if [[ -z "${game_name}" ]]; then
         echo "[SKIP RENAME] No game name resolved for ${steam_id} — filenames unchanged"
         continue
