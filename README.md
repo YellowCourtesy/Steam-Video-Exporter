@@ -29,10 +29,10 @@ This script processes raw Steam gameplay recordings (stored as fragmented video 
 - **Fallback**: CPU encoding with libsvtav1
 
 ### 🚀 Performance Optimizations
-- Parallel job execution (CPU threads − 2)
+- Parallel job execution (CPU threads −2)
 - RAM-backed temp directories (no disk I/O bottleneck)
-- Batch SteamID resolution in single API pass
-- Process substitution for stream copying (zero temp files)
+- Batch SteamID resolution
+- Process substitution for stream copying
 - GPU retry fallback on CPU if GPU encode fails
 
 ### 🛡️ Robust Error Handling
@@ -62,50 +62,18 @@ This script processes raw Steam gameplay recordings (stored as fragmented video 
 ### Optional
 - `jq` for faster JSON parsing (script falls back to grep if missing)
 
-## Installation
-
-```bash
-# Clone or download the script
-chmod +x convert-clips.sh
-
-# Create required directories (script auto-creates these)
-mkdir -p clips CONVERTED
-```
-
 ## Usage
 
 ### Basic Usage
 
 ```bash
+chmod +x convert-clips.sh
 ./convert-clips.sh
 ```
 
 The script will prompt you for:
 1. **Debug mode**: Enable detailed logging (`y/N`)
 2. **AV1 encoding**: Re-encode with AV1 for compression (`Y/n`)
-
-### Directory Structure
-
-Organize your Steam clips like this:
-
-```
-.
-├── convert-clips.sh
-├── clips/
-│   ├── clip_001/
-│   │   ├── video/
-│   │   │   ├── fg_0/
-│   │   │   │   ├── init-stream0.m4s
-│   │   │   │   ├── init-stream1.m4s
-│   │   │   │   ├── chunk-stream0-0.m4s
-│   │   │   │   ├── chunk-stream0-1.m4s
-│   │   │   │   ├── chunk-stream1-0.m4s
-│   │   │   │   └── chunk-stream1-1.m4s
-│   │   └── timelines/
-│   └── clip_002/
-│       └── video/ ...
-└── CONVERTED/          # Output goes here
-```
 
 ### Configuration
 
@@ -129,7 +97,7 @@ debug_mode_disabled="true"
 
 ### Processed Files
 
-Output files are created in `CONVERTED/` with the pattern:
+Output files are created in `Output/` with the pattern:
 
 ```
 GameName_YYYYMMDD_HHMMSS_av1.mkv  # If AV1 encoded
@@ -192,8 +160,7 @@ Half-Life_Alyx_20260320_091530_av1.mkv
 ### Disable AV1 for Speed
 Stream copying is much faster than re-encoding:
 ```bash
-av1_disabled="true"
-./convert-clips.sh
+av1_disabled="true" ./convert-clips.sh
 ```
 
 ### GPU Encoding
@@ -204,29 +171,10 @@ If you have a supported GPU, AV1 hardware encoding is 5–10× faster than CPU:
 - **Apple Silicon**: Excellent via VideoToolbox
 
 ### Parallel Processing
-The script automatically uses `CPU threads − 2` for parallelism. Adjust by running multiple instances with different clip directories.
+The script automatically uses `CPU threads − 2` (minus 2) for parallelism. Adjust by running multiple instances with different clip directories.
 
 ### RAM Disks
 The script uses `/dev/shm` (Linux) or `DARWIN_USER_TEMP_DIR` (macOS) automatically. Ensure your system has at least 2–4 GB free RAM.
-
-## Troubleshooting
-
-### ffmpeg timed out
-- Clips are very large or system is under heavy load
-- Increase timeout in the script (search for `timeout 600`)
-
-### GPU encode failed, retrying with CPU
-- GPU driver issue or not enough GPU memory
-- Check ffmpeg GPU encoder support: `ffmpeg -hide_banner -encoders | grep -i "av1\|hevc"`
-
-### SteamID not resolved
-- ID not in Steam app list (likely non-game content or internal test app)
-- SteamDB API unreachable
-- Manually edit `steam_id_cache.txt` to override
-
-### File already exists error
-- Delete or move existing files in `CONVERTED/`
-- Or use ffmpeg's `-n` flag to skip without overwriting
 
 ## Examples
 
@@ -244,17 +192,6 @@ av1_forced="true" debug_mode_disabled="true" ./convert-clips.sh
 ```bash
 debug_mode_forced="true" ./convert-clips.sh
 ```
-
-## System Requirements
-
-- **Disk Space**: Output files typically 50–200 MB each (depending on resolution/bitrate)
-- **RAM**: 2–4 GB for temp buffers (uses `/dev/shm`)
-- **CPU**: Multi-core recommended for parallel encoding
-- **GPU**: Optional but significantly speeds up AV1 encoding
-
-## License
-
-This script processes Steam game clips. Ensure you have the right to process and store gameplay recordings according to the game's terms of service and your local laws.
 
 ## Contributing
 
