@@ -14,23 +14,22 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # --- Directory & file paths (all relative to script_dir by default) ---
 clips_dir="${script_dir}/clips"           # Input: folder of clip subdirectories
-output_dir="${script_dir}/CONVERTED"         # Output: final processed video files
+output_dir="${script_dir}/Output"         # Output: final processed video files
 steam_id_cache="${script_dir}/steam_id_cache.txt"  # TSV: id <tab> name <tab> source <tab> date
 ffprobe_errors="${script_dir}/errors.txt"          # All ffprobe stream-integrity warnings, appended each run
 
-# If set to "true", AV1 re-encode is forced on without asking the user
-av1_forced="false"
+# --- Encoding & debug configuration ---
+# default_encoder: "copy" = stream copy (fast, no re-encode)
+#                  "av1"  = re-encode with AV1 (smaller files, slower)
+# This sets the default answer for the interactive AV1 prompt.
+# To skip the prompt entirely, also set encoder_prompt=false below.
+default_encoder="copy"
 
-# If set to "true", AV1 re-encode is forced off without asking the user
-# (av1_forced takes precedence if both are somehow set to "true")
-av1_disabled="false"
+# Set to false to suppress the AV1 encoding prompt and use default_encoder as-is
+encoder_prompt=true
 
-# If set to "true", debug mode is enabled without asking the user
-debug_mode_forced="false"
-
-# If set to "true", the debug mode prompt is suppressed and debug stays off
-# (debug_mode_forced takes precedence if both are somehow set to "true")
-debug_mode_disabled="false"
+# Debug mode: true = print each command before executing (set -x)
+debug_mode=false
 
 # Temporary error log; PID-suffixed copies are written by parallel jobs
 temp_errors="${script_dir}/temp_errors.txt"
@@ -218,56 +217,46 @@ detect_gpu() {
 detect_gpu
 
 # ---------------------------------------------------------------------------
-# Interactive prompts
-# (Skipped for individual options when their force/disable flag is set above)
+# Apply debug mode (no prompt — controlled entirely by the variable above)
 # ---------------------------------------------------------------------------
-
-# 1. Debug mode
-# debug_mode_forced=true   → always on, no prompt
-# debug_mode_disabled=true → always off, no prompt (forced wins if both true)
-# otherwise                → ask the user (default no)
-if [[ "${debug_mode_forced}" == "true" ]]; then
-    debug_mode=true
+if [[ "${debug_mode}" == "true" ]]; then
     set -x
-    echo "Debug mode enabled (forced)."
-elif [[ "${debug_mode_disabled}" == "true" ]]; then
-    debug_mode=false
-else
-    read -r -p "Enable debug mode? [y/N]: " debug_input
-    debug_input="${debug_input,,}"   # lowercase
-    if [[ "${debug_input}" == "y" || "${debug_input}" == "yes" ]]; then
-        debug_mode=true
-        set -x   # Print each command before executing
-        echo "Debug mode enabled."
-    else
-        debug_mode=false
-    fi
+    echo "Debug mode enabled."
 fi
 
-# 2. AV1 re-encode
-# av1_forced=true  → always encode with AV1, no prompt
-# av1_disabled=true → never encode with AV1, no prompt (av1_forced wins if both true)
-# otherwise        → ask the user (default yes)
-encode_av1=true   # Default: yes
-if [[ "${av1_forced}" == "true" ]]; then
-    encode_av1=true
-    echo "AV1 encoding enabled (forced)."
-elif [[ "${av1_disabled}" == "true" ]]; then
-    encode_av1=false
-    echo "AV1 encoding disabled (forced off)."
-else
-    read -r -p "Re-encode output files with AV1 to save space? [Y/n]: " av1_input
-    av1_input="${av1_input,,}"
-    if [[ "${av1_input}" == "n" || "${av1_input}" == "no" ]]; then
-        encode_av1=false
+# ---------------------------------------------------------------------------
+# Resolve encoder selection
+# ---------------------------------------------------------------------------
+encoder="${default_encoder}"
+
+# Optionally prompt the user to choose an encoder
+if [[ "${encoder_prompt}" == "true" ]]; then
+    echo "Select encoder:"
+    echo "  1) copy  — stream copy, no re-encode (fast)"
+    echo "  2) av1   — re-encode with AV1 (smaller files, slower)"
+    if [[ "${default_encoder}" == "av1" ]]; then
+        read -r -p "Encoder [1/2] (default: 2): " encoder_input
+    else
+        read -r -p "Encoder [1/2] (default: 1): " encoder_input
     fi
+    case "${encoder_input}" in
+        1) encoder="copy" ;;
+        2) encoder="av1"  ;;
+        "") ;;  # keep default_encoder
+        *)
+            echo -e "${YELLOW}[WARN] Invalid choice '${encoder_input}', using default: ${default_encoder}${NC}"
+            ;;
+    esac
 fi
+
+encode_av1=false
+[[ "${encoder}" == "av1" ]] && encode_av1=true
 
 echo ""
 echo "Configuration:"
 echo "  OS            : ${os}"
 echo "  Debug mode    : ${debug_mode}"
-echo "  AV1 encode    : ${encode_av1}"
+echo "  Encoder       : ${encoder}"
 echo "  GPU vendor    : ${gpu_vendor}"
 echo "  Clips dir     : ${clips_dir}"
 echo "  Output dir    : ${output_dir}"
