@@ -92,7 +92,7 @@ av1_forced="true" debug_mode_disabled="true" ./convert-clips.sh
 debug_mode_forced="true" ./convert-clips.sh
 ```
 
-### Configuration
+## Configuration
 
 Edit the script's `SECTION 1: ENVIRONMENT SETUP` to customize:
 
