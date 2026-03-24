@@ -1,4 +1,4 @@
-# Steam Clip Processor (`convert-clips.sh`)
+# Steam Video Converter
 
 A powerful bash script that automatically combines, re-encodes, and organizes Steam game clips into polished video files with proper game names.
 
