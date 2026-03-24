@@ -75,6 +75,23 @@ The script will prompt you for:
 1. **Debug mode**: Enable detailed logging (`y/N`)
 2. **AV1 encoding**: Re-encode with AV1 for compression (`Y/n`)
 
+## Examples
+
+### Encode only (no re-encode)
+```bash
+av1_disabled="true" ./convert-clips.sh
+```
+
+### Force AV1, disable prompts
+```bash
+av1_forced="true" debug_mode_disabled="true" ./convert-clips.sh
+```
+
+### Debug mode for troubleshooting
+```bash
+debug_mode_forced="true" ./convert-clips.sh
+```
+
 ### Configuration
 
 Edit the script's `SECTION 1: ENVIRONMENT SETUP` to customize:
@@ -176,22 +193,6 @@ The script automatically uses `CPU threads − 2` (minus 2) for parallelism. Adj
 ### RAM Disks
 The script uses `/dev/shm` (Linux) or `DARWIN_USER_TEMP_DIR` (macOS) automatically. Ensure your system has at least 2–4 GB free RAM.
 
-## Examples
-
-### Encode only (no re-encode)
-```bash
-av1_disabled="true" ./convert-clips.sh
-```
-
-### Force AV1, disable prompts
-```bash
-av1_forced="true" debug_mode_disabled="true" ./convert-clips.sh
-```
-
-### Debug mode for troubleshooting
-```bash
-debug_mode_forced="true" ./convert-clips.sh
-```
 
 ## Contributing
 
