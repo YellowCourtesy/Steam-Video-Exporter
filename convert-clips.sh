@@ -5,6 +5,8 @@
 # Dependencies: ffmpeg, coreutils (macOS), bash 4+
 # =============================================================================
 
+VERSION="1.1.1"
+
 # ===========================================================================
 # SECTION 1: ENVIRONMENT SETUP
 # ===========================================================================
@@ -254,6 +256,7 @@ encode_av1=false
 
 echo ""
 echo "Configuration:"
+echo "  Version       : ${VERSION}"
 echo "  OS            : ${os}"
 echo "  Debug mode    : ${debug_mode}"
 echo "  Encoder       : ${encoder}"
@@ -554,31 +557,13 @@ echo ""
 echo "=== Step 3: Renaming output files with game names ==="
 
 # ---------------------------------------------------------------------------
-# 3a. Strip "clip_" or "fg_" prefixes from all files in output_dir
-# ---------------------------------------------------------------------------
-for f in "${output_dir}"/*; do
-    [[ -f "${f}" ]] || continue
-    base="$(basename "${f}")"
-    dir="$(dirname "${f}")"
-    # Remove leading "clip_" or "fg_" prefix (case-sensitive)
-    new_base="${base#clip_}"
-    new_base="${new_base#fg_}"
-    if [[ "${new_base}" != "${base}" ]]; then
-        mv "${f}" "${dir}/${new_base}"
-        echo "[RENAME] ${base} → ${new_base}"
-    fi
-done
-
-# ---------------------------------------------------------------------------
-# 3b-pre. Remove garbage files with duplicated extensions (.mkv.mkv, etc.)
+# 3a. Remove garbage files with duplicated extensions (.mkv.mkv, etc.)
 # These can accumulate from previous failed runs. Delete them before we scan
 # so they are never picked up by the SteamID map or rename loop.
 # ---------------------------------------------------------------------------
 for f in "${output_dir}"/*; do
     [[ -f "${f}" ]] || continue
     base="$(basename "${f}")"
-    # Detect filenames with more than one dot-separated extension that is
-    # identical to the last extension, e.g. "foo.mkv.mkv" or "foo.mkv.mkv.mkv"
     ext="${base##*.}"                 # e.g. "mkv"
     stripped="${base%.*}"             # e.g. "foo.mkv"
     if [[ "${stripped##*.}" == "${ext}" ]]; then
@@ -588,25 +573,29 @@ for f in "${output_dir}"/*; do
 done
 
 # ---------------------------------------------------------------------------
-# 3b. Extract SteamIDs from filenames.
+# 3b. Extract SteamIDs from filenames (after stripping clip_/fg_ prefixes
+# in memory — no rename yet).
 # Convention: first numeric segment before the first "_" is the SteamID.
-# e.g.  730_20240101_some_clip.mkv  →  SteamID = 730
+# e.g.  clip_730_20240101_some_clip.mkv  →  SteamID = 730
 # ---------------------------------------------------------------------------
 declare -A steam_id_to_files   # map: steam_id → newline-separated list of files
 
 for f in "${output_dir}"/*; do
     [[ -f "${f}" ]] || continue
     base="$(basename "${f}")"
+    # Strip clip_/fg_ prefixes for SteamID extraction (in memory only)
+    stripped_base="${base#clip_}"
+    stripped_base="${stripped_base#fg_}"
     # Extract leading numeric segment
-    steam_id="$(echo "${base}" | grep -oE '^[0-9]+' || true)"
+    steam_id="$(echo "${stripped_base}" | grep -oE '^[0-9]+' || true)"
     [[ -z "${steam_id}" ]] && continue
     # Append this file to the map entry for that ID
     steam_id_to_files["${steam_id}"]="${steam_id_to_files[${steam_id}]+${steam_id_to_files[${steam_id}]}$'\n'}${f}"
 done
 
 # ---------------------------------------------------------------------------
-# 3c. Process each unique SteamID (sequentially — single thread for cache
-#     access and rate-limit safety)
+# 3c. Resolve game names for each unique SteamID (sequentially — single
+#     thread for cache access and rate-limit safety)
 # ---------------------------------------------------------------------------
 
 # Lock file for exclusive access to steam_id_cache
@@ -701,11 +690,6 @@ fetch_from_steamdb() {
         fi
     fi
     return 1
-}
-
-# Sanitise a game name so it's safe as a filename component
-sanitise_name() {
-    echo "$1" | tr -s '/:*?"<>|\\' '_'
 }
 
 # ---------------------------------------------------------------------------
@@ -840,41 +824,92 @@ if [[ "${#ids_still_unresolved[@]}" -gt 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3c-iii. Rename files using resolved names
+# 3d. Single-pass rename: strip prefixes, apply game name, sanitize for
+#     cross-platform compatibility — all in one mv per file.
+#
+# For each file this combines what were previously separate passes:
+#   - Strip "clip_" / "fg_" prefixes
+#   - Replace the leading SteamID with the resolved game name
+#   - Remove OS-illegal characters:  / \ : * ? " < > |
+#   - Remove control characters (0x00-0x1F, 0x7F)
+#   - Remove decorative Unicode symbols not normally seen in writing:
+#       ®  ™  ©  ℠  ℗  №  °  †  ‡  ¶  §  ¤  ¦  ¬  ¢  £  ¥  €  ¡  ¿
+#       «  »  ‹  ›  ‚  „  …  –  —  ′  ″  ‴
+#       Superscript/subscript digits (⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉)
+#       Decorative marks: ☆ ★ ● ◆ ♦ ♥ ♠ ♣ ▶ ◀ ■ □ ▪ ▫ ◊ ♪ ♫ ✓ ✗ ✦ ✧
+#   - Collapse whitespace → underscore, deduplicate underscores/hyphens
+#   - Strip leading/trailing dots, spaces, underscores
+#   - Handle filename collisions with numeric suffix
 # ---------------------------------------------------------------------------
-for steam_id in "${!steam_id_to_files[@]}"; do
-    game_name="${resolved_names[${steam_id}]:-}"
+echo ""
+echo "--- Step 3d: Renaming and sanitizing output files ---"
 
-    if [[ -z "${game_name}" ]]; then
-        echo "[SKIP RENAME] No game name resolved for ${steam_id} — filenames unchanged"
-        continue
-    fi
-    safe_name="$(sanitise_name "${game_name}")"
-    while IFS= read -r filepath; do
-        [[ -z "${filepath}" ]] && continue
-        [[ -f "${filepath}" ]] || continue
-        dir="$(dirname "${filepath}")"
-        base="$(basename "${filepath}")"
-        ext="${base##*.}"           # extension only, e.g. "mkv"
-        base_noext="${base%.*}"     # filename without extension, e.g. "206440_20260321_143021"
-        # Only act on files whose name still starts with the raw numeric SteamID
-        if [[ "${base_noext}" =~ ^[0-9]+ ]]; then
-            # Strip the SteamID prefix, prepend the game name
-            remainder="${base_noext#${steam_id}}"   # e.g. "_20260321_143021"
-            new_base="${safe_name}${remainder}"      # e.g. "Tribes_Ascend_20260321_143021"
-            # Collapse any accidental double underscores and trim edge underscores
-            new_base="$(echo "${new_base}" | sed 's/__*/_/g; s/^_//; s/_$//')"
-            new_base="${new_base}.${ext}"            # re-append extension exactly once
-            if [[ "${base}" != "${new_base}" ]]; then
-                mv "${filepath}" "${dir}/${new_base}"
-                echo "[RENAMED] ${base} → ${new_base}"
-            fi
+for f in "${output_dir}"/*; do
+    [[ -f "${f}" ]] || continue
+    dir="$(dirname "${f}")"
+    base="$(basename "${f}")"
+    ext="${base##*.}"
+    base_noext="${base%.*}"
+
+    # --- Phase 1: strip clip_/fg_ prefix ---
+    clean="${base_noext}"
+    clean="${clean#clip_}"
+    clean="${clean#fg_}"
+
+    # --- Phase 2: replace SteamID with game name ---
+    if [[ "${clean}" =~ ^[0-9]+ ]]; then
+        leading_id="$(echo "${clean}" | grep -oE '^[0-9]+' || true)"
+        if [[ -n "${leading_id}" && -n "${resolved_names[${leading_id}]:-}" ]]; then
+            game_name="${resolved_names[${leading_id}]}"
+            remainder="${clean#${leading_id}}"          # e.g. "_20260321_143021_av1"
+            clean="${game_name}${remainder}"
         fi
-    done <<< "${steam_id_to_files[${steam_id}]}"
+    fi
+
+    # --- Phase 3: cross-platform sanitization ---
+
+    # Strip filesystem-illegal characters:  / \ : * ? " < > |
+    clean="$(echo "${clean}" | tr -d '/:*?"<>|\\')"
+
+    # Strip control characters (0x00-0x1F and 0x7F)
+    clean="$(echo "${clean}" | tr -d '\000-\037\177')"
+
+    # Strip decorative / non-standard Unicode symbols
+    clean="$(echo "${clean}" | sed 's/[®™©℠℗№°†‡¶§¤¦¬¢£¥€¡¿«»‹›‚„…–—′″‴⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉☆★●◆♦♥♠♣▶◀■□▪▫◊♪♫✓✗✦✧]//g')"
+
+    # Replace whitespace runs with a single underscore
+    clean="$(echo "${clean}" | sed 's/[[:space:]][[:space:]]*/_/g')"
+
+    # Collapse multiple underscores / hyphens into one
+    clean="$(echo "${clean}" | sed 's/__*/_/g; s/--*/-/g')"
+
+    # Strip leading/trailing dots, spaces, and underscores
+    clean="$(echo "${clean}" | sed 's/^[._[:space:]]*//; s/[._[:space:]]*$//')"
+
+    # Fallback if name is now empty
+    if [[ -z "${clean}" ]]; then
+        clean="unnamed_clip"
+    fi
+
+    new_base="${clean}.${ext}"
+
+    # --- Rename (single mv) ---
+    if [[ "${base}" != "${new_base}" ]]; then
+        # Handle collision: if the target already exists, append a numeric suffix
+        if [[ -e "${dir}/${new_base}" ]]; then
+            collision_counter=1
+            while [[ -e "${dir}/${clean}_${collision_counter}.${ext}" ]]; do
+                collision_counter=$(( collision_counter + 1 ))
+            done
+            new_base="${clean}_${collision_counter}.${ext}"
+        fi
+        mv "${f}" "${dir}/${new_base}"
+        echo "[RENAMED] ${base} → ${new_base}"
+    fi
 done
 
 # ---------------------------------------------------------------------------
-# 3d. Sort steam_id_cache:
+# 3e. Sort steam_id_cache:
 #   1. Normal entries       — sorted by source then game name
 #   2. Demo / playtest      — sorted the same, after a blank line
 #   3. ERROR entries        — sorted by ID, after another blank line
