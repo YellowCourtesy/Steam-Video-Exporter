@@ -5,14 +5,15 @@
 # Dependencies: ffmpeg, coreutils (macOS), bash 4+
 # =============================================================================
 
-VERSION="1.1.1"
-
 # ===========================================================================
 # SECTION 1: ENVIRONMENT SETUP
 # ===========================================================================
 
 # Resolve the directory containing this script (works with symlinks too)
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# --- Script version ---
+script_version="1.2"
 
 # --- Directory & file paths (all relative to script_dir by default) ---
 clips_dir="${script_dir}/clips"           # Input: folder of clip subdirectories
@@ -105,6 +106,17 @@ fi
 if [[ "${missing_deps}" -ne 0 ]]; then
     echo -e "${RED}Please install the missing dependencies above and re-run the script.${NC}"
     exit 1
+fi
+
+# --- Optional dependency detection (not fatal, features degrade gracefully) ---
+has_jq=false
+has_curl=false
+
+if command -v jq &>/dev/null; then
+    has_jq=true
+fi
+if command -v curl &>/dev/null; then
+    has_curl=true
 fi
 
 # Choose the correct natural-sort binary
@@ -256,13 +268,21 @@ encode_av1=false
 
 echo ""
 echo "Configuration:"
-echo "  Version       : ${VERSION}"
+echo "  Version       : ${script_version}"
 echo "  OS            : ${os}"
 echo "  Debug mode    : ${debug_mode}"
 echo "  Encoder       : ${encoder}"
 echo "  GPU vendor    : ${gpu_vendor}"
 echo "  Clips dir     : ${clips_dir}"
 echo "  Output dir    : ${output_dir}"
+echo ""
+echo "Dependencies:"
+echo "  ffmpeg        : installed ($(ffmpeg -version 2>/dev/null | head -n 1 | sed 's/ffmpeg version //' | cut -d' ' -f1))"
+echo "  jq            : $(if [[ "${has_jq}" == "true" ]]; then echo "installed ($(jq --version 2>&1))"; else echo -e "${YELLOW}missing — using grep fallback for JSON parsing${NC}"; fi)"
+echo "  curl          : $(if [[ "${has_curl}" == "true" ]]; then echo "installed"; else echo -e "${YELLOW}missing — game name resolution disabled${NC}"; fi)"
+if [[ "${os}" == "macos" ]]; then
+echo "  gsort         : installed"
+fi
 echo ""
 
 # ===========================================================================
@@ -296,6 +316,248 @@ fi
 job_count=0
 declare -a job_pids=()
 declare -a job_exit_codes=()
+
+# ---------------------------------------------------------------------------
+# resolve_clip_timing(): Derive clip timing from folder name timestamps.
+#
+# Steam's recording folder names encode wall-clock timestamps:
+#   clip_<appid>_YYYYMMDD_HHMMSS   — when the clip was saved (= recording end)
+#   fg_<appid>_YYYYMMDD_HHMMSS     — when the recording buffer started (= clip start)
+#   timeline_<appid>YYYYMMDD_HHMMSS — when the game session began
+#
+# The timeline JSON markers use session-relative milliseconds (session start = 0).
+# By parsing HHMMSS from the timeline, fg, and clip folder names and computing
+# deltas in seconds × 1000 we get the clip's session-relative window.
+#
+# Usage:  resolve_clip_timing <clip_dir> <video_dir> <timelines_dir>
+# Sets global variables:
+#   ct_timeline_name   — timeline JSON filename (without .json extension)
+#   ct_clip_start_ms   — session-relative start time (ms)
+#   ct_clip_end_ms     — session-relative end time (ms)
+#   ct_clip_duration_ms — clip duration (ms)
+# Returns 0 on success, 1 if required folder names can't be parsed.
+# ---------------------------------------------------------------------------
+resolve_clip_timing() {
+    local clip_dir="$1"
+    local video_dir="$2"
+    local timelines_dir="$3"
+
+    ct_timeline_name=""
+    ct_clip_start_ms=""
+    ct_clip_end_ms=""
+    ct_clip_duration_ms=""
+
+    # --- Find timeline name from the timelines/ directory ---
+    # Pick the first (or only) .json file; its name encodes the session start time.
+    local timeline_file=""
+    if [[ -d "${timelines_dir}" ]]; then
+        timeline_file="$(find "${timelines_dir}" -maxdepth 1 -name '*.json' -type f 2>/dev/null | head -n 1)"
+    fi
+    if [[ -z "${timeline_file}" ]]; then
+        echo "[WARN] No timeline JSON found in ${timelines_dir}"
+        return 1
+    fi
+
+    # Extract timeline name (without .json) and its HHMMSS
+    local tl_basename
+    tl_basename="$(basename "${timeline_file}" .json)"
+    ct_timeline_name="${tl_basename}"
+
+    # Timeline name format: timeline_<appid>YYYYMMDD_HHMMSS
+    local tl_hhmmss="${tl_basename##*_}"   # last segment after underscore
+    if [[ ! "${tl_hhmmss}" =~ ^[0-9]{6}$ ]]; then
+        echo "[WARN] Cannot parse HHMMSS from timeline: ${tl_basename}"
+        return 1
+    fi
+    local tl_secs=$(( 10#${tl_hhmmss:0:2} * 3600 + 10#${tl_hhmmss:2:2} * 60 + 10#${tl_hhmmss:4:2} ))
+
+    # --- Find fg folder name to get recording start HHMMSS ---
+    local fg_dir=""
+    fg_dir="$(find "${video_dir}" -mindepth 1 -maxdepth 1 -type d -name 'fg_*' 2>/dev/null | head -n 1)"
+    if [[ -z "${fg_dir}" ]]; then
+        echo "[WARN] No fg_* directory found in ${video_dir}"
+        return 1
+    fi
+    local fg_basename
+    fg_basename="$(basename "${fg_dir}")"
+
+    # fg folder format: fg_<appid>_YYYYMMDD_HHMMSS
+    local fg_hhmmss="${fg_basename##*_}"
+    if [[ ! "${fg_hhmmss}" =~ ^[0-9]{6}$ ]]; then
+        echo "[WARN] Cannot parse HHMMSS from fg folder: ${fg_basename}"
+        return 1
+    fi
+    local fg_secs=$(( 10#${fg_hhmmss:0:2} * 3600 + 10#${fg_hhmmss:2:2} * 60 + 10#${fg_hhmmss:4:2} ))
+
+    # --- Get clip save time HHMMSS from the clip directory name ---
+    local clip_basename
+    clip_basename="$(basename "${clip_dir}")"
+
+    # Clip folder format: clip_<appid>_YYYYMMDD_HHMMSS
+    local clip_hhmmss="${clip_basename##*_}"
+    if [[ ! "${clip_hhmmss}" =~ ^[0-9]{6}$ ]]; then
+        echo "[WARN] Cannot parse HHMMSS from clip folder: ${clip_basename}"
+        return 1
+    fi
+    local clip_secs=$(( 10#${clip_hhmmss:0:2} * 3600 + 10#${clip_hhmmss:2:2} * 60 + 10#${clip_hhmmss:4:2} ))
+
+    # --- Handle midnight wraparound ---
+    # If fg or clip timestamp is earlier than timeline (crossed midnight),
+    # add 24 hours to the later timestamp.
+    if (( fg_secs < tl_secs )); then
+        fg_secs=$(( fg_secs + 86400 ))
+    fi
+    if (( clip_secs < tl_secs )); then
+        clip_secs=$(( clip_secs + 86400 ))
+    fi
+
+    # --- Compute session-relative times in milliseconds ---
+    ct_clip_start_ms=$(( (fg_secs - tl_secs) * 1000 ))
+    ct_clip_end_ms=$(( (clip_secs - tl_secs) * 1000 ))
+    ct_clip_duration_ms=$(( ct_clip_end_ms - ct_clip_start_ms ))
+
+    if (( ct_clip_duration_ms <= 0 )); then
+        echo "[WARN] Computed non-positive duration for ${clip_basename}: start=${ct_clip_start_ms}ms end=${ct_clip_end_ms}ms"
+        return 1
+    fi
+
+    echo "[TIMING] ${clip_basename}: start=${ct_clip_start_ms}ms end=${ct_clip_end_ms}ms duration=${ct_clip_duration_ms}ms (timeline=${ct_timeline_name})"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# build_ffmetadata(): Convert Steam timeline JSON → ffmpeg metadata file
+#                     with chapter markers, filtered and offset to the clip's
+#                     recording window.
+#
+# Usage:  build_ffmetadata <timelines_dir> <output_metadata_file> \
+#                          <clip_start_ms> <clip_end_ms> <clip_duration_ms> \
+#                          [timeline_name]
+#
+# Steam timeline format:
+#   { "entries": [ { "time": "27037", "type": "usermarker", ... }, ... ] }
+#   - "time" is milliseconds from the START OF THE GAME SESSION (not the clip)
+#   - The full session timeline is dumped into every clip's timelines/ folder
+#
+# This function:
+#   1. Finds the matching timeline JSON (by timeline_name if given, else all)
+#   2. Extracts usermarker timestamps
+#   3. Filters to only markers within [clip_start_ms, clip_end_ms]
+#   4. Offsets each marker by −clip_start_ms so times are clip-relative
+#   5. Writes ffmetadata format with TIMEBASE=1/1000
+#
+# Returns 0 if chapters were written, 1 if no markers matched.
+# ---------------------------------------------------------------------------
+build_ffmetadata() {
+    local timelines_dir="$1"
+    local metadata_file="$2"
+    local clip_start_ms="$3"
+    local clip_end_ms="$4"
+    local clip_duration_ms="$5"
+    local timeline_name="${6:-}"
+
+    # Collect timeline JSON files
+    local timeline_files=()
+    if [[ -d "${timelines_dir}" ]]; then
+        if [[ -n "${timeline_name}" && -f "${timelines_dir}/${timeline_name}.json" ]]; then
+            # Prefer the exact timeline referenced in clip.pb
+            timeline_files=("${timelines_dir}/${timeline_name}.json")
+        else
+            # Fallback: use all JSON files in the directory
+            mapfile -t timeline_files < <(find "${timelines_dir}" -maxdepth 1 -name '*.json' -type f 2>/dev/null | "${SORT_CMD}" -V)
+        fi
+    fi
+
+    if [[ "${#timeline_files[@]}" -eq 0 ]]; then
+        return 1
+    fi
+
+    # Extract all usermarker timestamps (ms) from timeline files
+    local all_times=()
+    for tf in "${timeline_files[@]}"; do
+        local times_from_file=()
+        if command -v jq &>/dev/null; then
+            mapfile -t times_from_file < <(
+                jq -r '.entries[]? | select(.type == "usermarker") | .time' "${tf}" 2>/dev/null || true
+            )
+        else
+            # grep fallback: extract "time" field values
+            mapfile -t times_from_file < <(
+                grep -oP '"time"\s*:\s*"\K[0-9]+' "${tf}" 2>/dev/null || true
+            )
+        fi
+        all_times+=("${times_from_file[@]}")
+    done
+
+    # Filter to clip window, offset, deduplicate, and sort
+    local clip_relative_times=()
+    for t in "${all_times[@]}"; do
+        [[ -z "${t}" ]] && continue
+        if (( t >= clip_start_ms && t <= clip_end_ms )); then
+            clip_relative_times+=("$(( t - clip_start_ms ))")
+        fi
+    done
+
+    # Deduplicate and sort numerically.
+    # Guard: if clip_relative_times is empty, skip immediately.
+    if [[ "${#clip_relative_times[@]}" -eq 0 ]]; then
+        return 1
+    fi
+    mapfile -t sorted_times < <(printf '%s\n' "${clip_relative_times[@]}" | sort -un)
+
+    # Filter out any empty entries (sort -un on empty input can produce one)
+    local clean_times=()
+    for st in "${sorted_times[@]}"; do
+        [[ -n "${st}" ]] && clean_times+=("${st}")
+    done
+    sorted_times=("${clean_times[@]}")
+
+    if [[ "${#sorted_times[@]}" -eq 0 ]]; then
+        return 1
+    fi
+
+    # Build the ffmetadata file
+    {
+        echo ";FFMETADATA1"
+        echo ""
+
+        local num_markers="${#sorted_times[@]}"
+        local i
+
+        # If the first marker is not at time 0, create an initial chapter
+        if [[ "${sorted_times[0]}" -gt 0 ]]; then
+            echo "[CHAPTER]"
+            echo "TIMEBASE=1/1000"
+            echo "START=0"
+            echo "END=$(( sorted_times[0] - 1 ))"
+            echo "title=Start"
+            echo ""
+        fi
+
+        for (( i = 0; i < num_markers; i++ )); do
+            local start_ms="${sorted_times[${i}]}"
+            local end_ms
+
+            if (( i + 1 < num_markers )); then
+                end_ms=$(( sorted_times[i + 1] - 1 ))
+            elif [[ -n "${clip_duration_ms}" && "${clip_duration_ms}" -gt "${start_ms}" ]]; then
+                end_ms="${clip_duration_ms}"
+            else
+                end_ms=$(( start_ms + 1000 ))
+            fi
+
+            echo "[CHAPTER]"
+            echo "TIMEBASE=1/1000"
+            echo "START=${start_ms}"
+            echo "END=${end_ms}"
+            echo "title=Marker $(( i + 1 ))"
+            echo ""
+        done
+    } > "${metadata_file}"
+
+    echo "[CHAPTERS] Generated ${num_markers} chapter marker(s) (filtered from session timeline)"
+    return 0
+}
 
 # ---------------------------------------------------------------------------
 # process_clip(): Convert one clip directory → one output file.
@@ -388,26 +650,99 @@ process_clip() {
     fi
 
     # -----------------------------------------------------------------------
+    # Resolve clip timing from folder name timestamps.
+    # Steam encodes wall-clock HHMMSS in the timeline, fg_*, and clip_*
+    # folder names. By computing deltas from the timeline (session start)
+    # we get the clip's session-relative start/end window in milliseconds.
+    # This is used to filter/offset timeline markers into correct chapters.
+    # -----------------------------------------------------------------------
+    local has_timing=false
+    if resolve_clip_timing "${clip_dir}" "${video_dir}" "${timelines_dir}"; then
+        has_timing=true
+    fi
+
+    # -----------------------------------------------------------------------
+    # Build chapter metadata from timeline files (if timing was resolved).
+    # Without timing we cannot determine the clip's session window, so
+    # chapters are skipped rather than risk placing markers at wrong times.
+    # -----------------------------------------------------------------------
+    local metadata_file="${ram_tmp}/.tmp_ffmetadata_${clip_name}_$$.txt"
+    local has_chapters=false
+
+    if [[ "${has_timing}" == "true" && -d "${timelines_dir}" ]]; then
+        if build_ffmetadata "${timelines_dir}" "${metadata_file}" \
+                "${ct_clip_start_ms}" "${ct_clip_end_ms}" \
+                "${ct_clip_duration_ms}" "${ct_timeline_name}"; then
+            has_chapters=true
+        else
+            echo "[INFO] ${clip_name}: No chapter markers fall within this clip's time window"
+        fi
+    fi
+
+    # -----------------------------------------------------------------------
+    # Locate thumbnail image for MKV cover art attachment.
+    # Steam stores a thumbnail at video/thumbnail (JPEG, no extension).
+    # ffmpeg can attach it as an MKV attachment with mimetype image/jpeg,
+    # which players like VLC and mpv display as cover art.
+    # -----------------------------------------------------------------------
+    local thumbnail="${video_dir}/thumbnail"
+    local has_thumbnail=false
+    local thumbnail_opts=()
+    if [[ -f "${thumbnail}" ]]; then
+        has_thumbnail=true
+        echo "[THUMB] ${clip_name}: Embedding thumbnail as cover art"
+    fi
+
+    # -----------------------------------------------------------------------
     # Build encode_opts based on mode and GPU availability.
     # For -c copy: no transcoding occurs so GPU acceleration is irrelevant;
     #   we use bash process substitution to pipe concat streams directly into
     #   ffmpeg without writing any temp file at all.
     # For AV1: write concatenated streams to RAM temp files, then encode.
     #   GPU path uses av1_gpu_opts (set by detect_gpu); CPU path uses libsvtav1.
+    #
+    # Input index tracking for ffmpeg -map_metadata and -map:
+    #   Process substitution / concat demuxer mode:
+    #     Input 0: video stream
+    #     Input 1: audio stream
+    #     Next input index depends on which optional inputs are added:
+    #       +1 for metadata file (if has_chapters)
+    #       Thumbnail is added via -attach, not as a numbered input.
     # -----------------------------------------------------------------------
     local ffmpeg_log="${ram_tmp}/.tmp_ffmpeg_${clip_name}_$$.log"
     local ffmpeg_exit=0
 
+    # Build the optional ffmpeg args for metadata and thumbnail.
+    # These are appended to every ffmpeg invocation below.
+    local extra_input_opts=()    # args BEFORE output file (additional -i flags)
+    local extra_output_opts=()   # args BEFORE output file (mapping, attachment)
+    local metadata_input_idx=""
+
+    if [[ "${has_chapters}" == "true" ]]; then
+        # -f ffmetadata tells ffmpeg to parse the file as an ffmetadata stream
+        # (chapter definitions, global tags, etc.). -map_metadata copies all
+        # metadata — including chapters — from the metadata input into the
+        # output container.
+        extra_input_opts+=(-f ffmetadata -i "${metadata_file}")
+        metadata_input_idx=2   # video=0, audio=1, metadata=2
+        extra_output_opts+=(-map_metadata "${metadata_input_idx}")
+    fi
+
+    if [[ "${has_thumbnail}" == "true" ]]; then
+        extra_output_opts+=(-attach "${thumbnail}" -metadata:s:t mimetype=image/jpeg -metadata:s:t filename=cover.jpg)
+    fi
+
     if [[ "${encode_mode}" == "copy" ]]; then
         # -c copy: pure stream remux — no decode/encode work.
         # Pipe init+chunks directly into ffmpeg via process substitution.
-        # This avoids ALL temp files; data flows init→chunks→ffmpeg in RAM.
         timeout 600 ffmpeg \
             -v error \
             -i <(cat "${video_init}" "${video_chunks[@]}") \
             -i <(cat "${audio_init}" "${audio_chunks[@]}") \
+            "${extra_input_opts[@]}" \
             -map 0:v:0 \
             -map 1:a:0 \
+            "${extra_output_opts[@]}" \
             -c copy \
             -y \
             "${output_file}" \
@@ -416,9 +751,7 @@ process_clip() {
 
     else
         # AV1 encode: ffmpeg needs seekable input for GPU upload and
-        # multi-pass analysis. Use the concat demuxer with a file list
-        # instead of cat-ing everything into a single temp file. This
-        # avoids doubling RAM usage and eliminates the sequential cat step.
+        # multi-pass analysis. Use the concat demuxer with a file list.
         local concat_video="${ram_tmp}/.tmp_concat_video_${clip_name}_$$.txt"
         local concat_audio="${ram_tmp}/.tmp_concat_audio_${clip_name}_$$.txt"
 
@@ -443,13 +776,15 @@ process_clip() {
             echo "[ENCODE] ${clip_name}: using CPU libsvtav1"
         fi
 
-        # First attempt: GPU (or CPU if gpu_vendor==none)
+        # First attempt
         timeout 600 ffmpeg \
             -v error \
             -f concat -safe 0 -i "${concat_video}" \
             -f concat -safe 0 -i "${concat_audio}" \
+            "${extra_input_opts[@]}" \
             -map 0:v:0 \
             -map 1:a:0 \
+            "${extra_output_opts[@]}" \
             "${encode_opts_arr[@]}" \
             -y \
             "${output_file}" \
@@ -463,8 +798,10 @@ process_clip() {
                 -v error \
                 -f concat -safe 0 -i "${concat_video}" \
                 -f concat -safe 0 -i "${concat_audio}" \
+                "${extra_input_opts[@]}" \
                 -map 0:v:0 \
                 -map 1:a:0 \
+                "${extra_output_opts[@]}" \
                 -c:v libsvtav1 -preset 13 -crf 0 -c:a flac -compression_level 12 \
                 -y \
                 "${output_file}" \
@@ -514,9 +851,9 @@ process_clip() {
 
     # -----------------------------------------------------------------------
     # Cleanup remaining temp files for this job
-    # (tmp_video/tmp_audio are removed inside the AV1 branch above)
     # -----------------------------------------------------------------------
     rm -f "${ffmpeg_log}"
+    rm -f "${metadata_file}"
 
     return "${ffmpeg_exit}"
 }
@@ -557,13 +894,31 @@ echo ""
 echo "=== Step 3: Renaming output files with game names ==="
 
 # ---------------------------------------------------------------------------
-# 3a. Remove garbage files with duplicated extensions (.mkv.mkv, etc.)
+# 3a. Strip "clip_" or "fg_" prefixes from all files in output_dir
+# ---------------------------------------------------------------------------
+for f in "${output_dir}"/*; do
+    [[ -f "${f}" ]] || continue
+    base="$(basename "${f}")"
+    dir="$(dirname "${f}")"
+    # Remove leading "clip_" or "fg_" prefix (case-sensitive)
+    new_base="${base#clip_}"
+    new_base="${new_base#fg_}"
+    if [[ "${new_base}" != "${base}" ]]; then
+        mv "${f}" "${dir}/${new_base}"
+        echo "[RENAME] ${base} → ${new_base}"
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# 3b-pre. Remove garbage files with duplicated extensions (.mkv.mkv, etc.)
 # These can accumulate from previous failed runs. Delete them before we scan
 # so they are never picked up by the SteamID map or rename loop.
 # ---------------------------------------------------------------------------
 for f in "${output_dir}"/*; do
     [[ -f "${f}" ]] || continue
     base="$(basename "${f}")"
+    # Detect filenames with more than one dot-separated extension that is
+    # identical to the last extension, e.g. "foo.mkv.mkv" or "foo.mkv.mkv.mkv"
     ext="${base##*.}"                 # e.g. "mkv"
     stripped="${base%.*}"             # e.g. "foo.mkv"
     if [[ "${stripped##*.}" == "${ext}" ]]; then
@@ -573,29 +928,25 @@ for f in "${output_dir}"/*; do
 done
 
 # ---------------------------------------------------------------------------
-# 3b. Extract SteamIDs from filenames (after stripping clip_/fg_ prefixes
-# in memory — no rename yet).
+# 3b. Extract SteamIDs from filenames.
 # Convention: first numeric segment before the first "_" is the SteamID.
-# e.g.  clip_730_20240101_some_clip.mkv  →  SteamID = 730
+# e.g.  730_20240101_some_clip.mkv  →  SteamID = 730
 # ---------------------------------------------------------------------------
 declare -A steam_id_to_files   # map: steam_id → newline-separated list of files
 
 for f in "${output_dir}"/*; do
     [[ -f "${f}" ]] || continue
     base="$(basename "${f}")"
-    # Strip clip_/fg_ prefixes for SteamID extraction (in memory only)
-    stripped_base="${base#clip_}"
-    stripped_base="${stripped_base#fg_}"
     # Extract leading numeric segment
-    steam_id="$(echo "${stripped_base}" | grep -oE '^[0-9]+' || true)"
+    steam_id="$(echo "${base}" | grep -oE '^[0-9]+' || true)"
     [[ -z "${steam_id}" ]] && continue
     # Append this file to the map entry for that ID
     steam_id_to_files["${steam_id}"]="${steam_id_to_files[${steam_id}]+${steam_id_to_files[${steam_id}]}$'\n'}${f}"
 done
 
 # ---------------------------------------------------------------------------
-# 3c. Resolve game names for each unique SteamID (sequentially — single
-#     thread for cache access and rate-limit safety)
+# 3c. Process each unique SteamID (sequentially — single thread for cache
+#     access and rate-limit safety)
 # ---------------------------------------------------------------------------
 
 # Lock file for exclusive access to steam_id_cache
@@ -690,6 +1041,11 @@ fetch_from_steamdb() {
         fi
     fi
     return 1
+}
+
+# Sanitise a game name so it's safe as a filename component
+sanitise_name() {
+    echo "$1" | tr -s ' /:*?"<>|\\' '_'
 }
 
 # ---------------------------------------------------------------------------
@@ -824,92 +1180,41 @@ if [[ "${#ids_still_unresolved[@]}" -gt 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3d. Single-pass rename: strip prefixes, apply game name, sanitize for
-#     cross-platform compatibility — all in one mv per file.
-#
-# For each file this combines what were previously separate passes:
-#   - Strip "clip_" / "fg_" prefixes
-#   - Replace the leading SteamID with the resolved game name
-#   - Remove OS-illegal characters:  / \ : * ? " < > |
-#   - Remove control characters (0x00-0x1F, 0x7F)
-#   - Remove decorative Unicode symbols not normally seen in writing:
-#       ®  ™  ©  ℠  ℗  №  °  †  ‡  ¶  §  ¤  ¦  ¬  ¢  £  ¥  €  ¡  ¿
-#       «  »  ‹  ›  ‚  „  …  –  —  ′  ″  ‴
-#       Superscript/subscript digits (⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉)
-#       Decorative marks: ☆ ★ ● ◆ ♦ ♥ ♠ ♣ ▶ ◀ ■ □ ▪ ▫ ◊ ♪ ♫ ✓ ✗ ✦ ✧
-#   - Collapse whitespace → underscore, deduplicate underscores/hyphens
-#   - Strip leading/trailing dots, spaces, underscores
-#   - Handle filename collisions with numeric suffix
+# 3c-iii. Rename files using resolved names
 # ---------------------------------------------------------------------------
-echo ""
-echo "--- Step 3d: Renaming and sanitizing output files ---"
+for steam_id in "${!steam_id_to_files[@]}"; do
+    game_name="${resolved_names[${steam_id}]:-}"
 
-for f in "${output_dir}"/*; do
-    [[ -f "${f}" ]] || continue
-    dir="$(dirname "${f}")"
-    base="$(basename "${f}")"
-    ext="${base##*.}"
-    base_noext="${base%.*}"
-
-    # --- Phase 1: strip clip_/fg_ prefix ---
-    clean="${base_noext}"
-    clean="${clean#clip_}"
-    clean="${clean#fg_}"
-
-    # --- Phase 2: replace SteamID with game name ---
-    if [[ "${clean}" =~ ^[0-9]+ ]]; then
-        leading_id="$(echo "${clean}" | grep -oE '^[0-9]+' || true)"
-        if [[ -n "${leading_id}" && -n "${resolved_names[${leading_id}]:-}" ]]; then
-            game_name="${resolved_names[${leading_id}]}"
-            remainder="${clean#${leading_id}}"          # e.g. "_20260321_143021_av1"
-            clean="${game_name}${remainder}"
+    if [[ -z "${game_name}" ]]; then
+        echo "[SKIP RENAME] No game name resolved for ${steam_id} — filenames unchanged"
+        continue
+    fi
+    safe_name="$(sanitise_name "${game_name}")"
+    while IFS= read -r filepath; do
+        [[ -z "${filepath}" ]] && continue
+        [[ -f "${filepath}" ]] || continue
+        dir="$(dirname "${filepath}")"
+        base="$(basename "${filepath}")"
+        ext="${base##*.}"           # extension only, e.g. "mkv"
+        base_noext="${base%.*}"     # filename without extension, e.g. "206440_20260321_143021"
+        # Only act on files whose name still starts with the raw numeric SteamID
+        if [[ "${base_noext}" =~ ^[0-9]+ ]]; then
+            # Strip the SteamID prefix, prepend the game name
+            remainder="${base_noext#${steam_id}}"   # e.g. "_20260321_143021"
+            new_base="${safe_name}${remainder}"      # e.g. "Tribes_Ascend_20260321_143021"
+            # Collapse any accidental double underscores and trim edge underscores
+            new_base="$(echo "${new_base}" | sed 's/__*/_/g; s/^_//; s/_$//')"
+            new_base="${new_base}.${ext}"            # re-append extension exactly once
+            if [[ "${base}" != "${new_base}" ]]; then
+                mv "${filepath}" "${dir}/${new_base}"
+                echo "[RENAMED] ${base} → ${new_base}"
+            fi
         fi
-    fi
-
-    # --- Phase 3: cross-platform sanitization ---
-
-    # Strip filesystem-illegal characters:  / \ : * ? " < > |
-    clean="$(echo "${clean}" | tr -d '/:*?"<>|\\')"
-
-    # Strip control characters (0x00-0x1F and 0x7F)
-    clean="$(echo "${clean}" | tr -d '\000-\037\177')"
-
-    # Strip decorative / non-standard Unicode symbols
-    clean="$(echo "${clean}" | sed 's/[®™©℠℗№°†‡¶§¤¦¬¢£¥€¡¿«»‹›‚„…–—′″‴⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉☆★●◆♦♥♠♣▶◀■□▪▫◊♪♫✓✗✦✧]//g')"
-
-    # Replace whitespace runs with a single underscore
-    clean="$(echo "${clean}" | sed 's/[[:space:]][[:space:]]*/_/g')"
-
-    # Collapse multiple underscores / hyphens into one
-    clean="$(echo "${clean}" | sed 's/__*/_/g; s/--*/-/g')"
-
-    # Strip leading/trailing dots, spaces, and underscores
-    clean="$(echo "${clean}" | sed 's/^[._[:space:]]*//; s/[._[:space:]]*$//')"
-
-    # Fallback if name is now empty
-    if [[ -z "${clean}" ]]; then
-        clean="unnamed_clip"
-    fi
-
-    new_base="${clean}.${ext}"
-
-    # --- Rename (single mv) ---
-    if [[ "${base}" != "${new_base}" ]]; then
-        # Handle collision: if the target already exists, append a numeric suffix
-        if [[ -e "${dir}/${new_base}" ]]; then
-            collision_counter=1
-            while [[ -e "${dir}/${clean}_${collision_counter}.${ext}" ]]; do
-                collision_counter=$(( collision_counter + 1 ))
-            done
-            new_base="${clean}_${collision_counter}.${ext}"
-        fi
-        mv "${f}" "${dir}/${new_base}"
-        echo "[RENAMED] ${base} → ${new_base}"
-    fi
+    done <<< "${steam_id_to_files[${steam_id}]}"
 done
 
 # ---------------------------------------------------------------------------
-# 3e. Sort steam_id_cache:
+# 3d. Sort steam_id_cache:
 #   1. Normal entries       — sorted by source then game name
 #   2. Demo / playtest      — sorted the same, after a blank line
 #   3. ERROR entries        — sorted by ID, after another blank line
