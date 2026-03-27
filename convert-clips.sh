@@ -5,6 +5,9 @@
 # Dependencies: ffmpeg, coreutils (macOS), bash 4+
 # =============================================================================
 
+# --- Script version ---
+script_version="1.2.1"
+
 # ===========================================================================
 # SECTION 1: ENVIRONMENT SETUP
 # ===========================================================================
@@ -28,8 +31,15 @@ default_encoder="copy"
 # Set to false to suppress the AV1 encoding prompt and use default_encoder as-is
 encoder_prompt=true
 
-# Debug mode: true = print each command before executing (set -x)
-debug_mode=false
+# Debug mode controls verbosity and diagnostic output:
+#   "off"     — no debug output (production default)
+#   "lite"    — timing, rename, and chapter details logged
+#   "default" — lite + set -x (trace every command)
+#   "max"     — default + exhaustive environment audit at startup
+debug_mode="off"
+
+# Latest run log: all console output is tee'd here; cleared on each new run
+latest_log="${script_dir}/latest.log"
 
 # Temporary error log; PID-suffixed copies are written by parallel jobs
 temp_errors="${script_dir}/temp_errors.txt"
@@ -59,6 +69,12 @@ mkdir -p "${output_dir}"
 touch "${steam_id_cache}"
 touch "${temp_errors}"
 touch "${ffprobe_errors}"
+
+# --- Clear and initialise latest.log, tee all output there ---
+# Every debug mode (including "off") writes to latest.log so there's always
+# a record of the most recent run. The file is truncated at the start.
+: > "${latest_log}"
+exec > >(tee -a "${latest_log}") 2>&1
 
 # ---------------------------------------------------------------------------
 # Detect operating system (Linux vs macOS)
@@ -228,11 +244,250 @@ detect_gpu() {
 detect_gpu
 
 # ---------------------------------------------------------------------------
-# Apply debug mode (no prompt — controlled entirely by the variable above)
+# Apply debug mode
 # ---------------------------------------------------------------------------
-if [[ "${debug_mode}" == "true" ]]; then
+# Validate debug_mode value
+case "${debug_mode}" in
+    off|lite|default|max) ;;
+    *)
+        echo -e "${YELLOW}[WARN] Invalid debug_mode '${debug_mode}', falling back to 'off'${NC}"
+        debug_mode="off"
+        ;;
+esac
+
+# Helper: returns 0 (true) if the current debug level is at least the given level
+debug_at_least() {
+    local required="$1"
+    case "${required}" in
+        off)     return 0 ;;
+        lite)    [[ "${debug_mode}" == "lite" || "${debug_mode}" == "default" || "${debug_mode}" == "max" ]] ;;
+        default) [[ "${debug_mode}" == "default" || "${debug_mode}" == "max" ]] ;;
+        max)     [[ "${debug_mode}" == "max" ]] ;;
+    esac
+}
+
+# "default" and "max" enable bash trace (set -x)
+if debug_at_least "default"; then
     set -x
-    echo "Debug mode enabled."
+    echo "Debug mode '${debug_mode}' enabled (set -x active)."
+elif debug_at_least "lite"; then
+    echo "Debug mode 'lite' enabled (verbose logging, no trace)."
+fi
+
+# ---------------------------------------------------------------------------
+# Maximum debug: exhaustive environment audit
+# ---------------------------------------------------------------------------
+if debug_at_least "max"; then
+    echo ""
+    echo "========================================"
+    echo "  DEBUG MAX: Environment Audit"
+    echo "========================================"
+
+    # --- System ---
+    echo ""
+    echo "--- System ---"
+    echo "  Hostname       : $(hostname 2>/dev/null || echo 'unknown')"
+    echo "  Kernel         : $(uname -srm 2>/dev/null || echo 'unknown')"
+    echo "  OS release     : $(cat /etc/os-release 2>/dev/null | grep -E '^(PRETTY_NAME|VERSION)=' | head -n 2 || sw_vers 2>/dev/null || echo 'unknown')"
+    echo "  Uptime         : $(uptime 2>/dev/null || echo 'unknown')"
+    echo "  Date/Time      : $(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null)"
+    echo "  Timezone       : $(date '+%Z (%:z)' 2>/dev/null)"
+    echo "  Locale         : ${LANG:-unset} (LC_ALL=${LC_ALL:-unset})"
+
+    # --- User & permissions ---
+    echo ""
+    echo "--- User & Permissions ---"
+    echo "  User           : $(whoami 2>/dev/null || id -un 2>/dev/null || echo 'unknown')"
+    echo "  UID/GID        : $(id 2>/dev/null || echo 'unknown')"
+    echo "  HOME           : ${HOME:-unset}"
+    echo "  Shell          : ${SHELL:-unset}"
+    echo "  Umask          : $(umask)"
+
+    # --- CPU & memory ---
+    echo ""
+    echo "--- CPU & Memory ---"
+    if [[ "${os}" == "linux" ]]; then
+        echo "  CPU model      : $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo 'unknown')"
+        echo "  CPU cores      : $(nproc 2>/dev/null || echo 'unknown') logical"
+        echo "  CPU frequency  : $(grep -m1 'cpu MHz' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo 'unknown') MHz"
+        echo "  Architecture   : $(uname -m 2>/dev/null || echo 'unknown')"
+        echo "  Memory total   : $(free -h 2>/dev/null | awk '/^Mem:/{print $2}' || echo 'unknown')"
+        echo "  Memory free    : $(free -h 2>/dev/null | awk '/^Mem:/{print $4}' || echo 'unknown')"
+        echo "  Memory avail   : $(free -h 2>/dev/null | awk '/^Mem:/{print $7}' || echo 'unknown')"
+        echo "  Swap total     : $(free -h 2>/dev/null | awk '/^Swap:/{print $2}' || echo 'unknown')"
+        echo "  Swap used      : $(free -h 2>/dev/null | awk '/^Swap:/{print $3}' || echo 'unknown')"
+        echo "  Load average   : $(cat /proc/loadavg 2>/dev/null || echo 'unknown')"
+    elif [[ "${os}" == "macos" ]]; then
+        echo "  CPU model      : $(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 'unknown')"
+        echo "  CPU cores      : $(sysctl -n hw.logicalcpu 2>/dev/null || echo 'unknown') logical, $(sysctl -n hw.physicalcpu 2>/dev/null || echo '?') physical"
+        echo "  Architecture   : $(uname -m 2>/dev/null || echo 'unknown')"
+        echo "  Memory total   : $(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 )) GB"
+        echo "  Load average   : $(sysctl -n vm.loadavg 2>/dev/null || uptime | sed 's/.*load averages: //' || echo 'unknown')"
+    fi
+
+    # --- Disk / Filesystem ---
+    echo ""
+    echo "--- Disk & Filesystem ---"
+    echo "  script_dir filesystem:"
+    df -h "${script_dir}" 2>/dev/null | tail -n 1 | awk '{printf "    Device: %s  Size: %s  Used: %s  Avail: %s  Use%%: %s  Mount: %s\n", $1,$2,$3,$4,$5,$6}' || echo "    unknown"
+    echo "  output_dir filesystem:"
+    df -h "${output_dir}" 2>/dev/null | tail -n 1 | awk '{printf "    Device: %s  Size: %s  Used: %s  Avail: %s  Use%%: %s  Mount: %s\n", $1,$2,$3,$4,$5,$6}' || echo "    unknown"
+    if [[ "${os}" == "linux" && -d /dev/shm ]]; then
+        echo "  /dev/shm (RAM disk):"
+        df -h /dev/shm 2>/dev/null | tail -n 1 | awk '{printf "    Size: %s  Used: %s  Avail: %s  Use%%: %s\n", $2,$3,$4,$5}' || echo "    unknown"
+    fi
+    echo "  Clips dir size : $(du -sh "${clips_dir}" 2>/dev/null | cut -f1 || echo 'unknown')"
+    echo "  Output dir size: $(du -sh "${output_dir}" 2>/dev/null | cut -f1 || echo 'unknown')"
+
+    # --- Directory permissions ---
+    echo ""
+    echo "--- Directory Permissions ---"
+    echo "  clips_dir  : $(ls -ld "${clips_dir}" 2>/dev/null | awk '{print $1, $3, $4}' || echo 'unknown')"
+    echo "  output_dir : $(ls -ld "${output_dir}" 2>/dev/null | awk '{print $1, $3, $4}' || echo 'unknown')"
+    echo "  script_dir : $(ls -ld "${script_dir}" 2>/dev/null | awk '{print $1, $3, $4}' || echo 'unknown')"
+    echo "  clips_dir writable  : $([[ -w "${clips_dir}" ]] && echo 'yes' || echo 'NO')"
+    echo "  output_dir writable : $([[ -w "${output_dir}" ]] && echo 'yes' || echo 'NO')"
+
+    # --- Bash ---
+    echo ""
+    echo "--- Bash ---"
+    echo "  Bash version   : ${BASH_VERSION}"
+    echo "  Bash path      : ${BASH}"
+    echo "  BASH_SOURCE     : ${BASH_SOURCE[0]}"
+    echo "  Bash options   : ${SHELLOPTS}"
+    echo "  Bash flags     : $-"
+    echo "  BASHPID        : ${BASHPID}"
+    echo "  PID ($$)       : $$"
+    echo "  PPID           : ${PPID}"
+
+    # --- ffmpeg deep inspection ---
+    echo ""
+    echo "--- ffmpeg ---"
+    echo "  Path           : $(command -v ffmpeg 2>/dev/null || echo 'not found')"
+    echo "  Version        : $(ffmpeg -version 2>/dev/null | head -n 1 || echo 'unknown')"
+    echo "  Build config   : $(ffmpeg -version 2>/dev/null | grep 'configuration:' | head -n 1 || echo 'unknown')"
+    echo "  libavcodec     : $(ffmpeg -version 2>/dev/null | grep 'libavcodec' | head -n 1 || echo 'unknown')"
+    echo "  libavformat    : $(ffmpeg -version 2>/dev/null | grep 'libavformat' | head -n 1 || echo 'unknown')"
+    echo "  libswscale     : $(ffmpeg -version 2>/dev/null | grep 'libswscale' | head -n 1 || echo 'unknown')"
+    echo "  HW accel APIs  : $(ffmpeg -hide_banner -hwaccels 2>/dev/null | tail -n +2 | tr '\n' ', ' || echo 'none')"
+    echo "  AV1 encoders   : $(ffmpeg -hide_banner -encoders 2>/dev/null | grep -i 'av1' | awk '{print $2}' | tr '\n' ', ' || echo 'none')"
+    echo "  HEVC encoders  : $(ffmpeg -hide_banner -encoders 2>/dev/null | grep -i 'hevc' | awk '{print $2}' | tr '\n' ', ' || echo 'none')"
+    echo "  H264 encoders  : $(ffmpeg -hide_banner -encoders 2>/dev/null | grep -i 'h264\|x264' | awk '{print $2}' | tr '\n' ', ' || echo 'none')"
+    echo "  MKV muxer      : $(ffmpeg -hide_banner -muxers 2>/dev/null | grep -i 'matroska' | awk '{print $2}' | tr '\n' ', ' || echo 'not found')"
+    echo "  FLAC encoder   : $(ffmpeg -hide_banner -encoders 2>/dev/null | grep -i 'flac' | awk '{print $2}' | tr '\n' ', ' || echo 'not found')"
+    echo "  Concat demuxer : $(ffmpeg -hide_banner -demuxers 2>/dev/null | grep -i 'concat' | awk '{print $2}' | tr '\n' ', ' || echo 'not found')"
+
+    # --- ffprobe ---
+    echo ""
+    echo "--- ffprobe ---"
+    echo "  Path           : $(command -v ffprobe 2>/dev/null || echo 'not found')"
+    echo "  Version        : $(ffprobe -version 2>/dev/null | head -n 1 || echo 'unknown')"
+
+    # --- GPU deep inspection ---
+    echo ""
+    echo "--- GPU ---"
+    echo "  Detected vendor: ${gpu_vendor}"
+    echo "  av1_gpu_opts   : ${av1_gpu_opts[*]:-<empty>}"
+    if [[ "${os}" == "linux" ]]; then
+        if command -v lspci &>/dev/null; then
+            echo "  VGA controllers:"
+            lspci 2>/dev/null | grep -iE 'VGA|3D|Display' | while IFS= read -r line; do
+                echo "    ${line}"
+            done
+        fi
+        if command -v nvidia-smi &>/dev/null; then
+            echo "  nvidia-smi:"
+            nvidia-smi --query-gpu=name,driver_version,memory.total,memory.free,temperature.gpu,utilization.gpu \
+                --format=csv,noheader 2>/dev/null | while IFS= read -r line; do
+                echo "    ${line}"
+            done || echo "    nvidia-smi query failed"
+        fi
+        echo "  /dev/dri nodes : $(ls /dev/dri/ 2>/dev/null | tr '\n' ', ' || echo 'none')"
+        if command -v vainfo &>/dev/null; then
+            echo "  VAAPI profiles : $(vainfo 2>/dev/null | grep -c 'VAProfile' || echo '0') profiles detected"
+        fi
+        if command -v vulkaninfo &>/dev/null; then
+            echo "  Vulkan device  : $(vulkaninfo --summary 2>/dev/null | grep 'deviceName' | head -n 1 | sed 's/.*= //' || echo 'unknown')"
+        fi
+    elif [[ "${os}" == "macos" ]]; then
+        echo "  GPU info       : $(system_profiler SPDisplaysDataType 2>/dev/null | grep -E 'Chipset Model|VRAM|Metal' | sed 's/^  */    /' || echo 'unknown')"
+    fi
+
+    # --- Other tools ---
+    echo ""
+    echo "--- Tool Versions ---"
+    echo "  curl           : $(curl --version 2>/dev/null | head -n 1 || echo 'not installed')"
+    echo "  jq             : $(jq --version 2>/dev/null || echo 'not installed')"
+    echo "  sort           : $(${SORT_CMD} --version 2>/dev/null | head -n 1 || echo 'unknown')"
+    echo "  grep           : $(grep --version 2>/dev/null | head -n 1 || echo 'unknown')"
+    echo "  sed            : $(sed --version 2>/dev/null | head -n 1 || echo 'unknown / BSD')"
+    echo "  awk            : $(awk --version 2>/dev/null | head -n 1 || echo 'unknown / BSD')"
+    echo "  timeout        : $(timeout --version 2>/dev/null | head -n 1 || echo 'available (no --version)' 2>/dev/null || echo 'not found')"
+    echo "  find           : $(find --version 2>/dev/null | head -n 1 || echo 'unknown / BSD')"
+    echo "  cat            : $(cat --version 2>/dev/null | head -n 1 || echo 'available')"
+    echo "  tee            : $(tee --version 2>/dev/null | head -n 1 || echo 'available')"
+    echo "  mktemp         : $(mktemp --version 2>/dev/null | head -n 1 || echo 'available')"
+    echo "  getconf        : $(command -v getconf &>/dev/null && echo 'available' || echo 'not found')"
+    echo "  lspci          : $(command -v lspci &>/dev/null && echo 'available' || echo 'not found')"
+    echo "  nvidia-smi     : $(command -v nvidia-smi &>/dev/null && echo 'available' || echo 'not found')"
+
+    # --- Network (relevant for Steam API calls) ---
+    echo ""
+    echo "--- Network ---"
+    echo "  DNS resolves store.steampowered.com : $(host store.steampowered.com 2>/dev/null | head -n 1 || getent hosts store.steampowered.com 2>/dev/null | head -n 1 || echo 'unable to check')"
+    echo "  curl reachability (store API)       : $(curl -s -o /dev/null -w '%{http_code}' --max-time 5 'https://store.steampowered.com/api/appdetails?appids=730' 2>/dev/null || echo 'failed')"
+    echo "  curl reachability (steamdb)         : $(curl -s -o /dev/null -w '%{http_code}' --max-time 5 'https://steamdb.info/api/GetAppDetails/?appid=730' 2>/dev/null || echo 'failed')"
+    echo "  curl reachability (app list)        : $(curl -s -o /dev/null -w '%{http_code}' --max-time 5 'https://api.steampowered.com/ISteamApps/GetAppList/v2/' 2>/dev/null || echo 'failed')"
+
+    # --- Environment variables ---
+    echo ""
+    echo "--- Relevant Environment Variables ---"
+    echo "  PATH           : ${PATH}"
+    echo "  TMPDIR         : ${TMPDIR:-unset}"
+    echo "  XDG_RUNTIME_DIR: ${XDG_RUNTIME_DIR:-unset}"
+    echo "  LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:-unset}"
+    echo "  DISPLAY        : ${DISPLAY:-unset}"
+    echo "  WAYLAND_DISPLAY: ${WAYLAND_DISPLAY:-unset}"
+    echo "  LIBVA_DRIVER_NAME: ${LIBVA_DRIVER_NAME:-unset}"
+    echo "  TERM           : ${TERM:-unset}"
+
+    # --- Clip directory inventory ---
+    echo ""
+    echo "--- Clip Inventory ---"
+    local clip_count
+    clip_count="$(find "${clips_dir}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+    echo "  Clip directories: ${clip_count}"
+    if [[ "${clip_count}" -gt 0 ]]; then
+        find "${clips_dir}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | while IFS= read -r d; do
+            local dname dsize chunk_count
+            dname="$(basename "${d}")"
+            dsize="$(du -sh "${d}" 2>/dev/null | cut -f1)"
+            chunk_count="$(find "${d}" -name '*.m4s' 2>/dev/null | wc -l)"
+            echo "    ${dname} (${dsize}, ${chunk_count} .m4s files)"
+        done
+    fi
+
+    # --- Cache state ---
+    echo ""
+    echo "--- Cache State ---"
+    echo "  Cache file     : ${steam_id_cache}"
+    echo "  Cache entries  : $(wc -l < "${steam_id_cache}" 2>/dev/null || echo '0')"
+    echo "  ERROR entries  : $(grep -cP '\tERROR\t' "${steam_id_cache}" 2>/dev/null || echo '0')"
+    echo "  Cache size     : $(du -h "${steam_id_cache}" 2>/dev/null | cut -f1 || echo '0')"
+
+    # --- Process limits ---
+    echo ""
+    echo "--- Process Limits ---"
+    echo "  Max open files : $(ulimit -n 2>/dev/null || echo 'unknown')"
+    echo "  Max user procs : $(ulimit -u 2>/dev/null || echo 'unknown')"
+    echo "  Max file size  : $(ulimit -f 2>/dev/null || echo 'unknown')"
+    echo "  Max stack size : $(ulimit -s 2>/dev/null || echo 'unknown')"
+
+    echo ""
+    echo "========================================"
+    echo "  End of Environment Audit"
+    echo "========================================"
+    echo ""
 fi
 
 # ---------------------------------------------------------------------------
@@ -265,8 +520,10 @@ encode_av1=false
 
 echo ""
 echo "Configuration:"
+echo "  Version       : ${script_version}"
 echo "  OS            : ${os}"
 echo "  Debug mode    : ${debug_mode}"
+echo "  Latest log    : ${latest_log}"
 echo "  Encoder       : ${encoder}"
 echo "  GPU vendor    : ${gpu_vendor}"
 echo "  Clips dir     : ${clips_dir}"
@@ -306,6 +563,109 @@ mapfile -t clip_dirs < <(find "${clips_dir}" -mindepth 1 -maxdepth 1 -type d | "
 
 if [[ "${#clip_dirs[@]}" -eq 0 ]]; then
     echo -e "${YELLOW}[WARN] No clip directories found in: ${clips_dir}${NC}"
+fi
+
+# ---------------------------------------------------------------------------
+# Check for existing output files and prompt the user once for all of them.
+# Options:
+#   1) Reconvert   — delete existing outputs and re-process those clips
+#   2) Merge       — keep existing video, but update thumbnails & chapters
+#   3) Skip        — leave existing outputs untouched, only process new clips
+# ---------------------------------------------------------------------------
+existing_outputs=()
+existing_clip_dirs=()
+new_clip_dirs=()
+
+for cdir in "${clip_dirs[@]}"; do
+    cname="$(basename "${cdir}")"
+
+    # Extract the YYYYMMDD_HHMMSS timestamp from the clip directory name.
+    # Clip dirs are named like: clip_<appid>_YYYYMMDD_HHMMSS
+    # After the appid, the remaining two underscore-separated segments are the timestamp.
+    clip_timestamp="$(echo "${cname}" | grep -oP '[0-9]{8}_[0-9]{6}$' || true)"
+
+    found_existing=""
+    if [[ -n "${clip_timestamp}" ]]; then
+        # Search output_dir for any .mkv whose name contains this timestamp.
+        # This matches regardless of renaming stage: clip_368340_20260319_150818.mkv,
+        # 368340_20260319_150818.mkv, or Cross_Code_20260319_150818.mkv all match.
+        for candidate in "${output_dir}"/*"${clip_timestamp}"*.mkv; do
+            if [[ -f "${candidate}" ]]; then
+                found_existing="${candidate}"
+                break
+            fi
+        done
+    fi
+
+    # Fallback: also check the literal expected name (handles edge cases)
+    if [[ -z "${found_existing}" ]]; then
+        if [[ "${encode_av1}" == "true" ]]; then
+            literal="${output_dir}/${cname}_av1.mkv"
+        else
+            literal="${output_dir}/${cname}.mkv"
+        fi
+        [[ -f "${literal}" ]] && found_existing="${literal}"
+    fi
+
+    if [[ -n "${found_existing}" ]]; then
+        existing_outputs+=("${found_existing}")
+        existing_clip_dirs+=("${cdir}")
+    else
+        new_clip_dirs+=("${cdir}")
+    fi
+done
+
+# duplicate_action: "reconvert" | "merge" | "skip"
+duplicate_action="skip"
+
+if [[ "${#existing_outputs[@]}" -gt 0 ]]; then
+    echo ""
+    echo -e "${YELLOW}Found ${#existing_outputs[@]} clip(s) already present in output directory:${NC}"
+    for eo in "${existing_outputs[@]}"; do
+        echo "  - $(basename "${eo}")"
+    done
+    echo ""
+    echo "How should these be handled?"
+    echo "  1) Reconvert  — delete and re-encode from source clips"
+    echo "  2) Merge      — keep video, update thumbnails & chapter markers"
+    echo "  3) Skip       — leave as-is, only process new clips (default)"
+    read -r -p "Choice [1/2/3] (default: 3): " dup_input
+    case "${dup_input}" in
+        1) duplicate_action="reconvert" ;;
+        2) duplicate_action="merge"     ;;
+        3) duplicate_action="skip"      ;;
+        "") duplicate_action="skip"     ;;
+        *)
+            echo -e "${YELLOW}[WARN] Invalid choice '${dup_input}', defaulting to skip.${NC}"
+            duplicate_action="skip"
+            ;;
+    esac
+    echo "[DUPLICATES] Action: ${duplicate_action} (${#existing_outputs[@]} file(s))"
+
+    case "${duplicate_action}" in
+        reconvert)
+            # Delete existing outputs so process_clip will recreate them
+            for eo in "${existing_outputs[@]}"; do
+                rm -f "${eo}"
+                echo "[DELETE] $(basename "${eo}") — will reconvert"
+            done
+            # All clip dirs are processed
+            clip_dirs=("${new_clip_dirs[@]}" "${existing_clip_dirs[@]}")
+            ;;
+        skip)
+            # Only process clips that don't have existing output
+            clip_dirs=("${new_clip_dirs[@]}")
+            if [[ "${#clip_dirs[@]}" -eq 0 ]]; then
+                echo "[INFO] All clips already processed — nothing new to encode."
+            fi
+            ;;
+        merge)
+            # Process new clips normally; existing ones get metadata-only update below
+            clip_dirs=("${new_clip_dirs[@]}")
+            ;;
+    esac
+else
+    echo "[INFO] No existing output files found — processing all clips."
 fi
 
 # --- Job counter for concurrency control ---
@@ -417,7 +777,9 @@ resolve_clip_timing() {
         return 1
     fi
 
-    echo "[TIMING] ${clip_basename}: start=${ct_clip_start_ms}ms end=${ct_clip_end_ms}ms duration=${ct_clip_duration_ms}ms (timeline=${ct_timeline_name})"
+    if debug_at_least "lite"; then
+        echo "[TIMING] ${clip_basename}: start=${ct_clip_start_ms}ms end=${ct_clip_end_ms}ms duration=${ct_clip_duration_ms}ms (timeline=${ct_timeline_name})"
+    fi
     return 0
 }
 
@@ -922,6 +1284,97 @@ for pid in "${job_pids[@]}"; do
 done
 echo "All encoding jobs finished."
 
+# ---------------------------------------------------------------------------
+# Merge pass: update thumbnails & chapter markers on existing output files
+# (only runs when the user chose "merge" for duplicate handling)
+# ---------------------------------------------------------------------------
+if [[ "${duplicate_action}" == "merge" && "${#existing_clip_dirs[@]}" -gt 0 ]]; then
+    echo ""
+    echo "=== Merge: Updating thumbnails & chapters on ${#existing_clip_dirs[@]} existing file(s) ==="
+
+    for (( _mi = 0; _mi < ${#existing_clip_dirs[@]}; _mi++ )); do
+        cdir="${existing_clip_dirs[${_mi}]}"
+        target="${existing_outputs[${_mi}]}"
+        cname="$(basename "${cdir}")"
+
+        [[ -f "${target}" ]] || continue
+        echo "[MERGE] $(basename "${target}")"
+
+        local_video_dir="${cdir}/video"
+        local_timelines_dir="${cdir}/timelines"
+
+        # --- Resolve timing and build chapter metadata ---
+        merge_metadata=""
+        merge_has_chapters=false
+        if [[ -d "${local_timelines_dir}" ]]; then
+            if resolve_clip_timing "${cdir}" "${local_video_dir}" "${local_timelines_dir}"; then
+                merge_meta_file="${script_dir}/.tmp_merge_meta_${cname}_$$.txt"
+                if build_ffmetadata "${local_timelines_dir}" "${merge_meta_file}" \
+                        "${ct_clip_start_ms}" "${ct_clip_end_ms}" \
+                        "${ct_clip_duration_ms}" "${ct_timeline_name}"; then
+                    merge_has_chapters=true
+                    merge_metadata="${merge_meta_file}"
+                fi
+            fi
+        fi
+
+        # --- Check for thumbnail ---
+        merge_thumbnail="${local_video_dir}/thumbnail"
+        merge_has_thumbnail=false
+        [[ -f "${merge_thumbnail}" ]] && merge_has_thumbnail=true
+
+        # If there's nothing to merge, skip
+        if [[ "${merge_has_chapters}" == "false" && "${merge_has_thumbnail}" == "false" ]]; then
+            echo "[MERGE] $(basename "${target}"): No new chapters or thumbnail to merge — skipping"
+            rm -f "${merge_metadata}"
+            continue
+        fi
+
+        # --- Re-mux: copy all streams, apply new metadata/thumbnail ---
+        merge_tmp="${target}.merge_tmp_$$.mkv"
+        merge_log="${script_dir}/.tmp_merge_ffmpeg_${cname}_$$.log"
+        merge_input_opts=()
+        merge_output_opts=()
+
+        # Map only video and audio streams from the original file (input 0).
+        # Using -map 0 would also copy existing attachments, which conflicts
+        # with -attach when re-adding a thumbnail.
+        merge_map_opts=(-map 0:v -map 0:a)
+
+        # Input 0 is the existing file
+        if [[ "${merge_has_chapters}" == "true" ]]; then
+            merge_input_opts+=(-f ffmetadata -i "${merge_metadata}")
+            # metadata input index = 1 (existing file = 0, metadata = 1)
+            merge_output_opts+=(-map_metadata 1)
+        fi
+
+        if [[ "${merge_has_thumbnail}" == "true" ]]; then
+            merge_output_opts+=(-attach "${merge_thumbnail}" -metadata:s:t mimetype=image/jpeg -metadata:s:t filename=cover.jpg)
+        fi
+
+        if timeout 120 ffmpeg \
+                -nostdin \
+                -v error \
+                -i "${target}" \
+                "${merge_input_opts[@]}" \
+                "${merge_map_opts[@]}" \
+                "${merge_output_opts[@]}" \
+                -c copy \
+                -y \
+                "${merge_tmp}" 2>"${merge_log}"; then
+            mv "${merge_tmp}" "${target}"
+            echo "[MERGE] $(basename "${target}"): Updated successfully"
+        else
+            echo -e "${YELLOW}[WARN] $(basename "${target}"): Merge failed (exit $?) — original file unchanged${NC}"
+            if [[ -s "${merge_log}" ]]; then
+                echo -e "${YELLOW}$(cat "${merge_log}")${NC}"
+            fi
+            rm -f "${merge_tmp}"
+        fi
+        rm -f "${merge_metadata}" "${merge_log}"
+    done
+fi
+
 # ===========================================================================
 # SECTION 3: ADD GAME NAMES TO OUTPUT FILES AND SORT
 # ===========================================================================
@@ -1079,9 +1532,16 @@ fetch_from_steamdb() {
     return 1
 }
 
-# Sanitise a game name so it's safe as a filename component
+# Sanitise a game name so it's safe as a filename component.
+# Keeps: letters, digits, hyphen, underscore, period, apostrophe, comma,
+#        ampersand, parentheses, and exclamation mark (normal writing chars).
+# Everything else (spaces, slashes, colons, emoji, control chars, etc.) → '_'
+# Then collapse runs of underscores and trim leading/trailing underscores.
 sanitise_name() {
-    echo "$1" | tr -s '/:*?"<>|\\' '_'
+    echo "$1" \
+        | sed "s/[^a-zA-Z0-9_.,'&!()-]/_/g" \
+        | tr -s '_' \
+        | sed 's/^_//; s/_$//'
 }
 
 # ---------------------------------------------------------------------------
@@ -1243,7 +1703,9 @@ for steam_id in "${!steam_id_to_files[@]}"; do
             new_base="${new_base}.${ext}"            # re-append extension exactly once
             if [[ "${base}" != "${new_base}" ]]; then
                 mv "${filepath}" "${dir}/${new_base}"
-                echo "[RENAMED] ${base} → ${new_base}"
+                if debug_at_least "lite"; then
+                    echo "[RENAMED] ${base} → ${new_base}"
+                fi
             fi
         fi
     done <<< "${steam_id_to_files[${steam_id}]}"
