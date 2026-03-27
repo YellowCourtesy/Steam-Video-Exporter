@@ -12,9 +12,6 @@
 # Resolve the directory containing this script (works with symlinks too)
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# --- Script version ---
-script_version="1.2"
-
 # --- Directory & file paths (all relative to script_dir by default) ---
 clips_dir="${script_dir}/clips"           # Input: folder of clip subdirectories
 output_dir="${script_dir}/Output"         # Output: final processed video files
@@ -268,7 +265,6 @@ encode_av1=false
 
 echo ""
 echo "Configuration:"
-echo "  Version       : ${script_version}"
 echo "  OS            : ${os}"
 echo "  Debug mode    : ${debug_mode}"
 echo "  Encoder       : ${encoder}"
@@ -441,7 +437,7 @@ resolve_clip_timing() {
 #
 # This function:
 #   1. Finds the matching timeline JSON (by timeline_name if given, else all)
-#   2. Extracts usermarker timestamps
+#   2. Extracts all entries with a time field (usermarkers, achievements, game events)
 #   3. Filters to only markers within [clip_start_ms, clip_end_ms]
 #   4. Offsets each marker by −clip_start_ms so times are clip-relative
 #   5. Writes ffmetadata format with TIMEBASE=1/1000
@@ -472,47 +468,70 @@ build_ffmetadata() {
         return 1
     fi
 
-    # Extract all usermarker timestamps (ms) from timeline files
-    local all_times=()
+    # Extract timestamps and titles from timeline entries.
+    # Supported types (all entries with a "time" field are included):
+    #   "usermarker"  — manual player marker, title = "Marker N" (numbered)
+    #   "achievement" — Steam achievement, title = achievement_name field
+    #   Game events   — custom game-pushed markers via AddTimelineEvent,
+    #                   title from .title field, fallback to .type
+    # Each entry is stored as "time<TAB>title" for paired sorting.
+    local all_entries=()
     for tf in "${timeline_files[@]}"; do
-        local times_from_file=()
+        local entries_from_file=()
         if command -v jq &>/dev/null; then
-            mapfile -t times_from_file < <(
-                jq -r '.entries[]? | select(.type == "usermarker") | .time' "${tf}" 2>/dev/null || true
+            # jq: extract time and a display title for every entry that has a time field
+            mapfile -t entries_from_file < <(
+                jq -r '
+                    .entries[]?
+                    | select(.time != null)
+                    | if .type == "usermarker" then
+                        "\(.time)\tusermarker"
+                      elif .type == "achievement" then
+                        "\(.time)\t\(.achievement_name // "Achievement")"
+                      elif (.title // "") != "" then
+                        "\(.time)\t\(.title)"
+                      else
+                        "\(.time)\t\(.type // "Event")"
+                      end
+                ' "${tf}" 2>/dev/null || true
             )
         else
-            # grep fallback: extract "time" field values
-            mapfile -t times_from_file < <(
-                grep -oP '"time"\s*:\s*"\K[0-9]+' "${tf}" 2>/dev/null || true
+            # grep fallback: extract all "time" values; titles will be generic
+            mapfile -t entries_from_file < <(
+                grep -oP '"time"\s*:\s*"\K[0-9]+' "${tf}" 2>/dev/null \
+                    | while read -r t; do echo "${t}"$'\t'"marker"; done || true
             )
         fi
-        all_times+=("${times_from_file[@]}")
+        all_entries+=("${entries_from_file[@]}")
     done
 
-    # Filter to clip window, offset, deduplicate, and sort
-    local clip_relative_times=()
-    for t in "${all_times[@]}"; do
+    # Filter to clip window, offset timestamps, keep paired titles
+    local filtered_entries=()
+    for entry in "${all_entries[@]}"; do
+        [[ -z "${entry}" ]] && continue
+        local t="${entry%%$'\t'*}"
+        local title="${entry#*$'\t'}"
         [[ -z "${t}" ]] && continue
         if (( t >= clip_start_ms && t <= clip_end_ms )); then
-            clip_relative_times+=("$(( t - clip_start_ms ))")
+            filtered_entries+=("$(( t - clip_start_ms ))"$'\t'"${title}")
         fi
     done
 
-    # Deduplicate and sort numerically.
-    # Guard: if clip_relative_times is empty, skip immediately.
-    if [[ "${#clip_relative_times[@]}" -eq 0 ]]; then
+    if [[ "${#filtered_entries[@]}" -eq 0 ]]; then
         return 1
     fi
-    mapfile -t sorted_times < <(printf '%s\n' "${clip_relative_times[@]}" | sort -un)
 
-    # Filter out any empty entries (sort -un on empty input can produce one)
-    local clean_times=()
-    for st in "${sorted_times[@]}"; do
-        [[ -n "${st}" ]] && clean_times+=("${st}")
+    # Sort by timestamp, deduplicate by time (keep first title for each time)
+    mapfile -t sorted_entries < <(printf '%s\n' "${filtered_entries[@]}" | sort -t$'\t' -k1,1 -un)
+
+    # Filter out empty entries
+    local clean_entries=()
+    for se in "${sorted_entries[@]}"; do
+        [[ -n "${se}" ]] && clean_entries+=("${se}")
     done
-    sorted_times=("${clean_times[@]}")
+    sorted_entries=("${clean_entries[@]}")
 
-    if [[ "${#sorted_times[@]}" -eq 0 ]]; then
+    if [[ "${#sorted_entries[@]}" -eq 0 ]]; then
         return 1
     fi
 
@@ -521,36 +540,53 @@ build_ffmetadata() {
         echo ";FFMETADATA1"
         echo ""
 
-        local num_markers="${#sorted_times[@]}"
+        local num_markers="${#sorted_entries[@]}"
         local i
+        local marker_count=0   # counter for numbering generic "Marker N" titles
+
+        # Extract just the timestamps for START/END calculations
+        local -a times=()
+        for se in "${sorted_entries[@]}"; do
+            times+=("${se%%$'\t'*}")
+        done
 
         # If the first marker is not at time 0, create an initial chapter
-        if [[ "${sorted_times[0]}" -gt 0 ]]; then
+        if [[ "${times[0]}" -gt 0 ]]; then
             echo "[CHAPTER]"
             echo "TIMEBASE=1/1000"
             echo "START=0"
-            echo "END=$(( sorted_times[0] - 1 ))"
+            echo "END=$(( times[0] - 1 ))"
             echo "title=Start"
             echo ""
         fi
 
         for (( i = 0; i < num_markers; i++ )); do
-            local start_ms="${sorted_times[${i}]}"
+            local start_ms="${times[${i}]}"
+            local raw_title="${sorted_entries[${i}]#*$'\t'}"
             local end_ms
 
             if (( i + 1 < num_markers )); then
-                end_ms=$(( sorted_times[i + 1] - 1 ))
+                end_ms=$(( times[i + 1] - 1 ))
             elif [[ -n "${clip_duration_ms}" && "${clip_duration_ms}" -gt "${start_ms}" ]]; then
                 end_ms="${clip_duration_ms}"
             else
                 end_ms=$(( start_ms + 1000 ))
             fi
 
+            # Determine display title
+            local display_title
+            if [[ "${raw_title}" == "usermarker" || "${raw_title}" == "marker" ]]; then
+                marker_count=$(( marker_count + 1 ))
+                display_title="Marker ${marker_count}"
+            else
+                display_title="${raw_title}"
+            fi
+
             echo "[CHAPTER]"
             echo "TIMEBASE=1/1000"
             echo "START=${start_ms}"
             echo "END=${end_ms}"
-            echo "title=Marker $(( i + 1 ))"
+            echo "title=${display_title}"
             echo ""
         done
     } > "${metadata_file}"
@@ -1045,7 +1081,7 @@ fetch_from_steamdb() {
 
 # Sanitise a game name so it's safe as a filename component
 sanitise_name() {
-    echo "$1" | tr -s ' /:*?"<>|\\' '_'
+    echo "$1" | tr -s '/:*?"<>|\\' '_'
 }
 
 # ---------------------------------------------------------------------------
