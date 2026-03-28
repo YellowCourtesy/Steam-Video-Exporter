@@ -6,7 +6,7 @@
 # =============================================================================
 
 # --- Script version ---
-script_version="1.2.1"
+script_version="1.2.2"
 
 # ===========================================================================
 # SECTION 1: ENVIRONMENT SETUP
@@ -544,8 +544,21 @@ echo ""
 
 # --- Determine parallelism limit ---
 cpu_threads="$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)"
-max_jobs=$(( cpu_threads > 2 ? cpu_threads - 2 : 1 ))
-echo "Parallelism: ${max_jobs} concurrent jobs (${cpu_threads} logical CPUs detected)"
+if [[ "${encode_av1}" == "true" ]]; then
+    if [[ "${gpu_vendor}" != "none" ]]; then
+        # GPU AV1 encoders (AMF, NVENC, VAAPI, QSV) typically support only
+        # one or two concurrent sessions. Serialise to avoid overloading.
+        max_jobs=1
+    else
+        # CPU AV1 (libsvtav1) is extremely memory- and compute-intensive.
+        # Cap at 2 concurrent encodes to avoid starving the system.
+        max_jobs=$(( cpu_threads > 8 ? 2 : 1 ))
+    fi
+    echo "Parallelism: ${max_jobs} concurrent job(s) — AV1 encode mode (${cpu_threads} logical CPUs detected)"
+else
+    max_jobs=$(( cpu_threads > 2 ? cpu_threads - 2 : 1 ))
+    echo "Parallelism: ${max_jobs} concurrent jobs (${cpu_threads} logical CPUs detected)"
+fi
 
 # --- Trap: kill all child processes when this script exits ---
 # This ensures no runaway background jobs remain if the script is killed.
@@ -1149,19 +1162,15 @@ process_clip() {
 
     else
         # AV1 encode: ffmpeg needs seekable input for GPU upload and
-        # multi-pass analysis. Use the concat demuxer with a file list.
-        local concat_video="${ram_tmp}/.tmp_concat_video_${clip_name}_$$.txt"
-        local concat_audio="${ram_tmp}/.tmp_concat_audio_${clip_name}_$$.txt"
+        # multi-pass analysis. Concatenate init+chunks into single temp
+        # files in RAM, then feed them as regular inputs.
+        # (The concat demuxer cannot handle fragmented .m4s chunks because
+        # each chunk lacks the moov/tfhd headers needed to parse standalone.)
+        local tmp_video="${ram_tmp}/.tmp_video_${clip_name}_$$.mp4"
+        local tmp_audio="${ram_tmp}/.tmp_audio_${clip_name}_$$.mp4"
 
-        # Build concat demuxer file lists (init segment first, then chunks)
-        {
-            printf "file '%s'\n" "${video_init}"
-            printf "file '%s'\n" "${video_chunks[@]}"
-        } > "${concat_video}"
-        {
-            printf "file '%s'\n" "${audio_init}"
-            printf "file '%s'\n" "${audio_chunks[@]}"
-        } > "${concat_audio}"
+        cat "${video_init}" "${video_chunks[@]}" > "${tmp_video}"
+        cat "${audio_init}" "${audio_chunks[@]}" > "${tmp_audio}"
 
         # Select GPU or CPU encoder
         local encode_opts_arr
@@ -1177,8 +1186,8 @@ process_clip() {
         # First attempt
         timeout 600 ffmpeg \
             -v error \
-            -f concat -safe 0 -i "${concat_video}" \
-            -f concat -safe 0 -i "${concat_audio}" \
+            -i "${tmp_video}" \
+            -i "${tmp_audio}" \
             "${extra_input_opts[@]}" \
             -map 0:v:0 \
             -map 1:a:0 \
@@ -1194,8 +1203,8 @@ process_clip() {
             echo -e "${YELLOW}[WARN] ${clip_name}: GPU encode failed (exit ${ffmpeg_exit}), retrying with CPU...${NC}"
             timeout 600 ffmpeg \
                 -v error \
-                -f concat -safe 0 -i "${concat_video}" \
-                -f concat -safe 0 -i "${concat_audio}" \
+                -i "${tmp_video}" \
+                -i "${tmp_audio}" \
                 "${extra_input_opts[@]}" \
                 -map 0:v:0 \
                 -map 1:a:0 \
@@ -1207,7 +1216,7 @@ process_clip() {
             ffmpeg_exit=$?
         fi
 
-        rm -f "${concat_video}" "${concat_audio}"
+        rm -f "${tmp_video}" "${tmp_audio}"
     fi
 
     # -----------------------------------------------------------------------
